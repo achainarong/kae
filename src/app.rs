@@ -1,6 +1,6 @@
 use std::{
-    cell::RefCell,
-    collections::HashMap,
+    cell::{Cell, RefCell},
+    collections::{HashMap, VecDeque},
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
@@ -23,7 +23,7 @@ use crate::{
     config::{self, Config},
     conflict::{Choice, Conflict},
     editor,
-    git::{Action, CommitFiles, GitOutput, Hunks, Repo, Snapshot},
+    git::{Action, CommitFiles, GitOutput, Hunks, IndexRequest, Repo, Snapshot},
     history::{DiffLayout, Document, HistoricalPreview, History, Position, Preferences, Search},
     loader::{Loader, Preview, ReadData, ReadKind, Request},
     rebase::{Plan, RebaseAction},
@@ -32,6 +32,38 @@ use crate::{
 };
 
 struct MouseCapture;
+
+// Unsupported terminals ignore the enhancement; Ctrl-J remains a newline fallback.
+struct KeyboardMode;
+
+impl KeyboardMode {
+    fn enable() -> Result<Self> {
+        let mode = Self;
+        mode.resume()?;
+        Ok(mode)
+    }
+
+    fn resume(&self) -> Result<()> {
+        crossterm::execute!(
+            std::io::stdout(),
+            event::PushKeyboardEnhancementFlags(
+                event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        )?;
+        Ok(())
+    }
+
+    fn suspend(&self) -> Result<()> {
+        crossterm::execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags)?;
+        Ok(())
+    }
+}
+
+impl Drop for KeyboardMode {
+    fn drop(&mut self) {
+        let _ = self.suspend();
+    }
+}
 
 impl Drop for MouseCapture {
     fn drop(&mut self) {
@@ -555,6 +587,10 @@ pub enum Modal {
         caption: String,
         input: String,
     },
+    CommitMessage {
+        command: CommandId,
+        editor: Box<editor::ResultEditor>,
+    },
     Confirm {
         task: Task,
         detail: String,
@@ -583,7 +619,20 @@ struct WorkerResult {
     conflict: Option<Box<Conflict>>,
 }
 
+struct IndexResult {
+    output: std::result::Result<GitOutput, String>,
+}
+
 pub struct App {
+    pub manual_list_scroll: Cell<bool>,
+    index_queue: VecDeque<IndexRequest>,
+    index_worker: Option<Receiver<IndexResult>>,
+    index_session: bool,
+    index_scopes: Vec<PathBuf>,
+    index_status_read: Option<u64>,
+    guard_stale: bool,
+    guard_read: Option<u64>,
+    after_guard: Option<(CommandId, Option<String>)>,
     pub remote_tree: crate::history::FileTree,
     pub filters: [ListFilter; 7],
     pub preview_search: Search,
@@ -592,11 +641,17 @@ pub struct App {
     pub list_state: RefCell<ratatui::widgets::ListState>,
     pub file_tree_override: Option<bool>,
     pub pending_staging: HashMap<PathBuf, bool>,
+    pub folder_status: HashMap<PathBuf, (usize, usize)>,
+    last_input: Instant,
+    refresh_round: u8,
+    force_preview_refresh: bool,
+    preview_valid: bool,
     dragging: bool,
     layout_save: Option<Instant>,
     pub history_graph: bool,
     pub history_all: bool,
     pub mouse_position: Option<(u16, u16)>,
+    pub hover_started: Option<Instant>,
     pub show_path: bool,
     pub explorer_state: RefCell<ratatui::widgets::ListState>,
     pub repo: Repo,
@@ -642,6 +697,273 @@ pub struct ListFilter {
 }
 
 impl App {
+    fn index_command(command: CommandId) -> bool {
+        matches!(
+            command,
+            CommandId::Stage | CommandId::Unstage | CommandId::StageAll | CommandId::UnstageAll
+        )
+    }
+
+    fn enqueue_index(&mut self, command: CommandId) -> Result<()> {
+        ensure!(self.loaded, "Wait for repository loading to finish");
+        ensure!(
+            self.busy.is_none() || self.index_session,
+            "Wait for the current Git operation"
+        );
+        ensure!(command.available(self), "Select a file or folder first");
+        let staged = matches!(command, CommandId::Stage | CommandId::StageAll);
+        let all = matches!(command, CommandId::StageAll | CommandId::UnstageAll);
+        let (path, bulk) = if all {
+            (PathBuf::from("."), true)
+        } else {
+            let row = self
+                .explorer
+                .selected()
+                .context("Select a file or folder")?;
+            (
+                if row.path.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    row.path.clone()
+                },
+                row.file.is_none(),
+            )
+        };
+        let mut request = IndexRequest {
+            staged,
+            bulk,
+            scopes: vec![path],
+            rename_sources: Vec::new(),
+        };
+        let files = self
+            .snapshot
+            .files
+            .iter()
+            .filter(|file| request.covers(&file.path))
+            .collect::<Vec<_>>();
+        ensure!(
+            !staged
+                || !bulk
+                || !files.iter().any(|file| file.is_conflict()
+                    && self.pending_staging.get(&file.path) != Some(&true)),
+            "Resolve and stage conflicted files individually before staging this folder or root"
+        );
+        let status_originals = files
+            .iter()
+            .filter_map(|file| file.original.clone())
+            .collect::<Vec<_>>();
+        request.merge(IndexRequest {
+            staged,
+            bulk,
+            scopes: if staged {
+                Vec::new()
+            } else {
+                status_originals.clone()
+            },
+            rename_sources: if staged {
+                status_originals.clone()
+            } else {
+                Vec::new()
+            },
+        });
+        request.scopes.sort();
+        request.scopes.dedup();
+        self.cancel_reads();
+        self.guard_stale = true;
+        self.index_session = true;
+        self.error = None;
+        self.busy = Some("Updating index".into());
+        for file in &self.snapshot.files {
+            if request.covers(&file.path)
+                || file
+                    .original
+                    .as_ref()
+                    .is_some_and(|path| request.covers(path))
+            {
+                self.pending_staging.insert(file.path.clone(), staged);
+            }
+        }
+        self.folder_status = tree::folder_status(&self.snapshot.files, &self.pending_staging);
+        let mut dirty = IndexRequest {
+            staged,
+            bulk,
+            scopes: std::mem::take(&mut self.index_scopes),
+            rename_sources: Vec::new(),
+        };
+        dirty.merge(request.clone());
+        dirty.merge(IndexRequest {
+            staged,
+            bulk,
+            scopes: status_originals,
+            rename_sources: Vec::new(),
+        });
+        self.index_scopes = dirty.scopes;
+        if let Some(last) = self.index_queue.back_mut() {
+            if last.scopes == request.scopes && last.bulk == request.bulk {
+                *last = request;
+                return Ok(());
+            }
+            if last.staged == staged && last.bulk == bulk {
+                last.merge(request);
+                return Ok(());
+            }
+        }
+        self.index_queue.push_back(request);
+        Ok(())
+    }
+
+    fn poll_index(&mut self) -> bool {
+        if !self.index_session {
+            return false;
+        }
+        let mut changed = false;
+        if let Some(receiver) = &self.index_worker {
+            let result = match receiver.try_recv() {
+                Ok(result) => result.output,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => Err("Index worker stopped unexpectedly".into()),
+            };
+            self.index_worker = None;
+            changed = true;
+            let failure = match result {
+                Ok(output) => {
+                    self.last_output = format!("Index update\n\n{}", output.text());
+                    (!output.success).then(|| self.last_output.clone())
+                }
+                Err(error) => {
+                    self.last_output = error.clone();
+                    Some(error)
+                }
+            };
+            if let Some(error) = failure {
+                self.index_queue.clear();
+                self.error = Some(format!(
+                    "{error}\nQueued staging changes were cancelled; refreshing actual status."
+                ));
+            }
+        }
+        if self.index_worker.is_none() {
+            if let Some(mut request) = self.index_queue.pop_front() {
+                while self
+                    .index_queue
+                    .front()
+                    .is_some_and(|next| next.staged == request.staged && next.bulk == request.bulk)
+                {
+                    request.merge(self.index_queue.pop_front().expect("queued index request"));
+                }
+                let repo = self.repo.clone();
+                let ui = thread::current();
+                let (sender, receiver) = mpsc::channel();
+                self.index_worker = Some(receiver);
+                thread::spawn(move || {
+                    let output = repo
+                        .update_index(&request)
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = sender.send(IndexResult { output });
+                    ui.unpark();
+                });
+                return true;
+            }
+            if self.index_status_read.is_none() {
+                self.index_status_read =
+                    Some(self.read(ReadKind::IndexStatus(self.index_scopes.clone())));
+                return true;
+            }
+        }
+        changed
+    }
+
+    fn reconcile_index(&mut self, scopes: Vec<PathBuf>, files: Vec<crate::git::FileChange>) {
+        let request = IndexRequest {
+            staged: false,
+            bulk: false,
+            scopes,
+            rename_sources: Vec::new(),
+        };
+        let previous = self.explorer.clone();
+        let selected_path = self
+            .snapshot
+            .files
+            .get(self.selected)
+            .map(|file| file.path.clone());
+        self.snapshot.files.retain(|file| {
+            !request.covers(&file.path)
+                && !file
+                    .original
+                    .as_ref()
+                    .is_some_and(|path| request.covers(path))
+        });
+        self.snapshot.files.extend(files);
+        self.snapshot
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        self.snapshot
+            .files
+            .dedup_by(|left, right| left.path == right.path);
+        self.pending_staging.clear();
+        self.folder_status = tree::folder_status(&self.snapshot.files, &self.pending_staging);
+        self.explorer = tree::explorer(&self.snapshot.files, &self.repo.root);
+        self.explorer.restore_view(&previous);
+        if self.workspace == Workspace::Files {
+            self.selected = self
+                .explorer
+                .selected()
+                .and_then(|row| row.file)
+                .or_else(|| {
+                    selected_path.and_then(|path| {
+                        self.snapshot
+                            .files
+                            .iter()
+                            .position(|file| file.path == path)
+                    })
+                })
+                .unwrap_or(0);
+            if !self.files_tree_visible() && self.snapshot.files.len() == 1 {
+                self.explorer.select_file(0);
+                self.selected = 0;
+                self.focus = Focus::Preview;
+            }
+        }
+        self.last_refresh = Instant::now();
+        if self.error.is_none() {
+            self.notice = "Index updated".into();
+        }
+        self.request_preview(false);
+    }
+
+    pub fn tooltip_visible(&self) -> bool {
+        self.show_path
+            || (self.hovered_row().is_some()
+                && self
+                    .hover_started
+                    .is_some_and(|started| started.elapsed() >= Duration::from_millis(300)))
+    }
+    fn hovered_row(&self) -> Option<usize> {
+        if self.modal.is_some() || self.workspace != Workspace::Files || !self.files_tree_visible()
+        {
+            return None;
+        }
+        let (x, y) = self.mouse_position?;
+        let geometry = self.geometry.borrow();
+        let inner = geometry.list.inner(ratatui::layout::Margin::new(1, 1));
+        if !inner.contains(ratatui::layout::Position::new(x, y)) {
+            return None;
+        }
+        geometry.rows.get(usize::from(y - inner.y)).copied()
+    }
+
+    fn mouse_event(&mut self, mouse: MouseEvent) -> bool {
+        let previous = (self.tooltip_visible(), self.show_path, self.hovered_row());
+        self.handle_mouse(mouse);
+        let current = (self.tooltip_visible(), self.show_path, self.hovered_row());
+        let changed = mouse.kind != MouseEventKind::Moved
+            || previous.0 != current.0
+            || (previous.0 && previous != current);
+        if changed {
+            self.last_input = Instant::now();
+        }
+        changed
+    }
     pub fn visible_items(&self) -> Vec<(usize, String)> {
         let query = self.filters[self.workspace.index()].query.to_lowercase();
         self.items()
@@ -895,6 +1217,7 @@ impl App {
                 self.mouse_position = None;
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                self.manual_list_scroll.set(false);
                 self.mouse_position = None;
                 self.filters[self.workspace.index()].editing = false;
                 let inner = geometry.list.inner(ratatui::layout::Margin::new(1, 1));
@@ -944,14 +1267,39 @@ impl App {
                 }
             }
             MouseEventKind::Moved if !self.dragging => {
+                let previous = self.hovered_row();
                 self.show_path = false;
                 self.mouse_position = Some((mouse.column, mouse.row));
+                let current = self.hovered_row();
+                if previous != current {
+                    self.hover_started = current.map(|_| Instant::now());
+                }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 if !geometry.list.contains(position) && !geometry.preview.contains(position) {
                     return;
                 }
                 let down = mouse.kind == MouseEventKind::ScrollDown;
+                if geometry.list.contains(position)
+                    && (matches!(self.modal, Some(Modal::Commit(_)))
+                        || (self.modal.is_none() && self.workspace == Workspace::Files))
+                {
+                    let height = usize::from(geometry.list.height.saturating_sub(2));
+                    let (state, count) = if let Some(Modal::Commit(view)) = &self.modal {
+                        (&view.list_state, view.history.tree.rows.len())
+                    } else {
+                        (&self.explorer_state, self.explorer.rows.len())
+                    };
+                    let mut state = state.borrow_mut();
+                    *state.offset_mut() = state
+                        .offset()
+                        .saturating_add_signed(if down { 3 } else { -3 })
+                        .min(count.saturating_sub(height.max(1)));
+                    self.manual_list_scroll.set(true);
+                    self.mouse_position = None;
+                    self.show_path = false;
+                    return;
+                }
                 let code = if down { KeyCode::Down } else { KeyCode::Up };
                 if let Some(Modal::Commit(view)) = &mut self.modal {
                     view.focus = if geometry.preview.contains(position) {
@@ -959,9 +1307,11 @@ impl App {
                     } else {
                         Focus::List
                     };
+                    let manual_scroll = self.manual_list_scroll.get();
                     for _ in 0..3 {
                         self.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
                     }
+                    self.manual_list_scroll.set(manual_scroll);
                 } else {
                     self.focus = if geometry.preview.contains(position) {
                         Focus::Preview
@@ -1031,6 +1381,15 @@ impl App {
             }
         };
         let mut app = Self {
+            manual_list_scroll: Cell::new(false),
+            index_queue: VecDeque::new(),
+            index_worker: None,
+            index_session: false,
+            index_scopes: Vec::new(),
+            index_status_read: None,
+            guard_stale: false,
+            guard_read: None,
+            after_guard: None,
             remote_tree: tree::remotes(&snapshot),
             filters: std::array::from_fn(|_| ListFilter::default()),
             preview_search: Search::default(),
@@ -1039,11 +1398,17 @@ impl App {
             list_state: RefCell::new(ratatui::widgets::ListState::default()),
             file_tree_override: None,
             pending_staging: HashMap::new(),
+            folder_status: HashMap::new(),
+            last_input: Instant::now(),
+            refresh_round: 0,
+            force_preview_refresh: false,
+            preview_valid: false,
             dragging: false,
             layout_save: None,
             history_graph: false,
             history_all: false,
             mouse_position: None,
+            hover_started: None,
             show_path: false,
             explorer_state: RefCell::new(ratatui::widgets::ListState::default()),
             repo,
@@ -1111,6 +1476,7 @@ impl App {
         crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
         let _mouse = MouseCapture;
         let paste = editor::PasteMode::enable()?;
+        let keyboard = KeyboardMode::enable()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         for signal in [
             signal_hook::consts::SIGINT,
@@ -1120,9 +1486,15 @@ impl App {
             signal_hook::flag::register(signal, Arc::clone(&shutdown))?;
         }
         let mut redraw = true;
+        let mut tooltip_visible = false;
         while !self.quit {
             redraw |= self.poll_worker();
             redraw |= self.poll_loading();
+            let visible = self.tooltip_visible();
+            if visible != tooltip_visible {
+                redraw = true;
+                tooltip_visible = visible;
+            }
             if self
                 .layout_save
                 .is_some_and(|at| at.elapsed() >= Duration::from_millis(350))
@@ -1143,10 +1515,12 @@ impl App {
             if let Some(path) = self.edit_path.take() {
                 crossterm::execute!(std::io::stdout(), event::DisableMouseCapture)?;
                 paste.suspend()?;
+                keyboard.suspend()?;
                 ratatui::restore();
                 let result = editor::open(&path);
                 *terminal = ratatui::init();
                 paste.resume()?;
+                keyboard.resume()?;
                 crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
                 terminal.clear()?;
                 if let Err(error) = result {
@@ -1160,7 +1534,7 @@ impl App {
                 terminal.draw(|frame| ui::draw(frame, self))?;
                 redraw = false;
             }
-            if event::poll(Duration::from_millis(80))? {
+            if event::poll(Duration::ZERO)? {
                 redraw = true;
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -1191,9 +1565,11 @@ impl App {
                         self.mouse_position = None;
                         self.update_width(width);
                     }
-                    Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    Event::Mouse(mouse) => redraw = self.mouse_event(mouse),
                     _ => {}
                 }
+            } else {
+                thread::park_timeout(Duration::from_millis(8));
             }
         }
         if self.layout_save.is_some() {
@@ -1331,6 +1707,8 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.manual_list_scroll.set(false);
+        self.last_input = Instant::now();
         if self.dragging {
             self.dragging = false;
             self.save_layout();
@@ -1338,6 +1716,12 @@ impl App {
         self.mouse_position = None;
         if key.code != KeyCode::Char('w') {
             self.show_path = false;
+        }
+        if matches!(self.modal, Some(Modal::CommitMessage { .. })) {
+            if let Some(modal) = self.modal.take() {
+                self.handle_modal(modal, key);
+            }
+            return;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.busy.is_some() {
@@ -1417,24 +1801,28 @@ impl App {
             }
             // The mutation worker owns writes, not the UI. Keep read-only
             // navigation live; do not queue mutations against an old snapshot.
-            if !matches!(
-                key.code,
-                KeyCode::Char('?')
-                    | KeyCode::Char('1'..='7')
-                    | KeyCode::Char('[' | ']' | 'j' | 'k' | 'h' | 'l')
-                    | KeyCode::Char('/' | 'n' | 'N')
-                    | KeyCode::Up
-                    | KeyCode::Down
-                    | KeyCode::Left
-                    | KeyCode::Right
-                    | KeyCode::Tab
-                    | KeyCode::BackTab
-                    | KeyCode::PageUp
-                    | KeyCode::PageDown
-                    | KeyCode::Home
-                    | KeyCode::End
-                    | KeyCode::Esc
-            ) {
+            let index_input = self.index_session
+                && matches!(key.code, KeyCode::Char(' ' | 's' | 'u' | 'S' | 'U'));
+            if !index_input
+                && !matches!(
+                    key.code,
+                    KeyCode::Char('?')
+                        | KeyCode::Char('1'..='7')
+                        | KeyCode::Char('[' | ']' | 'j' | 'k' | 'h' | 'l')
+                        | KeyCode::Char('/' | 'n' | 'N')
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Tab
+                        | KeyCode::BackTab
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Esc
+                )
+            {
                 self.notice =
                     "Git is running; navigation is available, further mutations are locked.".into();
                 return;
@@ -1704,6 +2092,8 @@ impl App {
             }
             Modal::Loading(label) => {
                 if closing {
+                    self.guard_read = None;
+                    self.after_guard = None;
                     self.history_preferences = None;
                     self.detail_read = None;
                     self.request_preview(false);
@@ -1754,6 +2144,36 @@ impl App {
                     _ => {}
                 }
                 self.modal = Some(Modal::Palette { filter, selected });
+            }
+            Modal::CommitMessage {
+                command,
+                mut editor,
+            } => {
+                match key.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        editor.area.insert_newline();
+                    }
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        editor.area.insert_newline();
+                    }
+                    KeyCode::Enter => {
+                        let message = editor.text();
+                        if message.trim().is_empty() {
+                            self.error = Some("Please enter a commit message.".into());
+                        } else {
+                            self.error = None;
+                            if let Err(error) = self.prepare(command, Some(message)) {
+                                self.fail(error);
+                            }
+                            return;
+                        }
+                    }
+                    _ => {
+                        editor.area.input(key);
+                    }
+                }
+                self.modal = Some(Modal::CommitMessage { command, editor });
             }
             Modal::Prompt {
                 kind,
@@ -2398,62 +2818,23 @@ impl App {
                 .filter(|file| file.path.starts_with(&row.path))
                 .collect()
         };
-        if files.iter().any(|file| file.status.as_bytes()[1] != b' ') {
+        if files.iter().any(|file| {
+            self.pending_staging
+                .get(&file.path)
+                .map(|staged| !*staged)
+                .unwrap_or(file.status.as_bytes()[1] != b' ')
+        }) {
             self.invoke(CommandId::Stage);
-        } else if files
-            .iter()
-            .any(|file| !matches!(file.status.as_bytes()[0], b' ' | b'?'))
-        {
+        } else if files.iter().any(|file| {
+            self.pending_staging
+                .get(&file.path)
+                .copied()
+                .unwrap_or(!matches!(file.status.as_bytes()[0], b' ' | b'?'))
+        }) {
             self.invoke(CommandId::Unstage);
         } else {
             self.notice = "No changes to stage or unstage in this selection.".into();
         }
-    }
-
-    fn prepare_folder(&mut self, command: CommandId) -> Result<()> {
-        let row = self.explorer.selected().context("Select a folder")?;
-        ensure!(row.file.is_none(), "Select a folder");
-        let files = self
-            .snapshot
-            .files
-            .iter()
-            .filter(|file| file.path.starts_with(&row.path))
-            .collect::<Vec<_>>();
-        ensure!(!files.is_empty(), "No changed files in this folder");
-        // Never silently mark unresolved conflicts as resolved in a bulk action.
-        ensure!(
-            command != CommandId::Stage || !files.iter().any(|file| file.is_conflict()),
-            "Resolve and stage conflicted files individually before staging this folder"
-        );
-        let args: &[&str] = if command == CommandId::Stage {
-            &["add", "--all"]
-        } else if self.snapshot.head.is_some() {
-            &["restore", "--staged"]
-        } else {
-            &["rm", "--cached", "-f"]
-        };
-        let mut action = Action::new(&self.snapshot, command.label(), args);
-        action.args.push("--".into());
-        let mut paths = std::collections::BTreeSet::new();
-        for file in &files {
-            // Untracked files have no index entry to restore/remove.
-            if command == CommandId::Unstage && file.status == "??" {
-                continue;
-            }
-            paths.insert(file.path.clone());
-            if let Some(original) = &file.original
-                && (command == CommandId::Unstage
-                    || !matches!(file.status.as_bytes()[0], b'R' | b'C'))
-            {
-                paths.insert(original.clone());
-            }
-        }
-        ensure!(!paths.is_empty(), "No staged files in this folder");
-        action
-            .args
-            .extend(paths.into_iter().map(|path| path.into_os_string()));
-        self.start(Task::Git(action));
-        Ok(())
     }
 
     fn preview_target(&self) -> Preview {
@@ -2470,6 +2851,7 @@ impl App {
                 );
             }
             return Preview::Folder {
+                path: row.path.clone(),
                 heading: if row.path.as_os_str().is_empty() {
                     self.repo.root.display().to_string()
                 } else {
@@ -2635,6 +3017,7 @@ impl App {
             self.scroll = 0;
             self.horizontal = 0;
             self.preview = "Loading preview…".into();
+            self.preview_valid = false;
             self.preview_search
                 .reindex(&Document::full(&self.preview), 0);
         }
@@ -2694,6 +3077,12 @@ impl App {
     }
 
     fn invoke(&mut self, command: CommandId) {
+        if Self::index_command(command) {
+            if let Err(error) = self.enqueue_index(command) {
+                self.fail(error);
+            }
+            return;
+        }
         if self.busy.is_some() {
             self.notice = "Wait for the current Git operation before making another change.".into();
             return;
@@ -2713,6 +3102,20 @@ impl App {
     }
 
     fn prompt(&mut self, command: CommandId, caption: &str, input: String) {
+        if matches!(command, CommandId::Commit | CommandId::Amend) {
+            match editor::ResultEditor::new(&input) {
+                Ok(mut editor) => {
+                    editor.set_theme(&self.theme);
+                    editor.area.set_block(ratatui::widgets::Block::default());
+                    self.modal = Some(Modal::CommitMessage {
+                        command,
+                        editor: Box::new(editor),
+                    });
+                }
+                Err(error) => self.fail(error),
+            }
+            return;
+        }
         self.modal = Some(Modal::Prompt {
             kind: PromptKind::Command(command),
             caption: caption.into(),
@@ -2722,6 +3125,27 @@ impl App {
 
     fn prepare(&mut self, command: CommandId, input: Option<String>) -> Result<()> {
         use CommandId::*;
+        if Self::index_command(command) {
+            return self.enqueue_index(command);
+        }
+        let simple = matches!(command, Theme | ToggleTree | Log | Edit);
+        let prompt = input.is_none()
+            && matches!(
+                command,
+                Commit | Amend | BranchCreate | BranchRename | StashSave | TagCreate | WorktreeAdd
+            );
+        if self.guard_stale && !simple && !prompt {
+            ensure!(!self.index_session, "Wait for staged changes to finish");
+            self.cancel_reads();
+            self.after_guard = Some((command, input));
+            self.guard_read = Some(self.read(ReadKind::Snapshot {
+                all_history: self.history_all,
+            }));
+            self.modal = Some(Modal::Loading(
+                "Validating repository before reviewed action…".into(),
+            ));
+            return Ok(());
+        }
         if command == ToggleTree {
             self.toggle_file_tree();
             return Ok(());
@@ -2743,9 +3167,6 @@ impl App {
             });
             return Ok(());
         }
-        if matches!(command, Stage | Unstage) && !self.file_selected() {
-            return self.prepare_folder(command);
-        }
         if matches!(
             command,
             Hunks | Discard | Edit | Resolve | TakeCurrent | TakeIncoming | DeleteConflict
@@ -2759,7 +3180,7 @@ impl App {
         let mut confirm = false;
         let mut detail = command.label().to_owned();
         let action = match command {
-            Theme | ToggleTree => unreachable!(),
+            Theme | ToggleTree | Stage | Unstage | StageAll | UnstageAll => unreachable!(),
             Log => {
                 self.output("Last Git operation", self.last_output.clone());
                 return Ok(());
@@ -2845,16 +3266,13 @@ impl App {
                 self.start(Task::Preview(action));
                 return Ok(());
             }
-            Stage | Unstage | Discard | TakeCurrent | TakeIncoming | DeleteConflict => {
+            Discard | TakeCurrent | TakeIncoming | DeleteConflict => {
                 let file = self
                     .snapshot
                     .files
                     .get(self.selected)
                     .context("Select a file")?;
-                let mut action = match command {
-                    Stage => new(&["add"]),
-                    Unstage if self.snapshot.head.is_some() => new(&["restore", "--staged"]),
-                    Unstage => new(&["rm", "--cached", "-f"]),
+                match command {
                     Discard => {
                         ensure!(!file.is_conflict(), "Use conflict side choices instead of discarding an unmerged file.");
                         confirm = true;
@@ -2868,24 +3286,8 @@ impl App {
                     }
                     DeleteConflict => { confirm = true; detail = format!("Delete conflicted file {:?} from the working tree AND stage its deletion?\nManual edits will be lost. Git will refuse unsafe removal without force.", file.path); new(&["rm"]) }
                     _ => unreachable!(),
-                }.path(&file.path);
-                if (command == Unstage
-                    || (command == Stage && !matches!(file.status.as_bytes()[0], b'R' | b'C')))
-                    && let Some(original) = &file.original
-                {
-                    action.args.push(original.as_os_str().to_owned());
-                }
-                action
+                }.path(&file.path)
             }
-            StageAll => {
-                ensure!(
-                    !self.snapshot.files.iter().any(|file| file.is_conflict()),
-                    "Resolve and stage conflicted files individually before staging all files"
-                );
-                new(&["add", "--all"])
-            }
-            UnstageAll if self.snapshot.head.is_some() => new(&["restore", "--staged", "--", "."]),
-            UnstageAll => new(&["rm", "--cached", "-r", "-f", "--", "."]),
             Commit | Amend => {
                 let Some(message) = input else {
                     if command == Amend {
@@ -3200,6 +3602,7 @@ impl App {
             return;
         }
         self.optimistic_staging(&task);
+        self.folder_status = tree::folder_status(&self.snapshot.files, &self.pending_staging);
         self.cancel_reads();
         let repo = self.repo.clone();
         let all_history = self.history_all;
@@ -3215,6 +3618,7 @@ impl App {
         self.busy = Some(label.clone());
         self.error = None;
         let (sender, receiver) = mpsc::channel();
+        let ui = thread::current();
         self.worker = Some(receiver);
         thread::spawn(move || {
             let preview = matches!(task, Task::Preview(_));
@@ -3249,24 +3653,32 @@ impl App {
                 preview,
                 conflict: saved_conflict,
             });
+            ui.unpark();
         });
     }
 
     pub fn poll_worker(&mut self) -> bool {
+        let index_changed = self.poll_index();
+        if self.worker.is_none() {
+            return index_changed;
+        }
         let result = match self.worker.as_ref().map(Receiver::try_recv) {
             Some(Ok(result)) => result,
             Some(Err(TryRecvError::Disconnected)) => {
                 self.pending_staging.clear();
+                self.folder_status =
+                    tree::folder_status(&self.snapshot.files, &self.pending_staging);
                 self.busy = None;
                 self.worker = None;
                 self.error = Some("Git worker stopped unexpectedly. Refresh and inspect repository state before retrying.".into());
                 return true;
             }
-            _ => return false,
+            _ => return index_changed,
         };
         self.busy = None;
         self.worker = None;
         self.pending_staging.clear();
+        self.folder_status = tree::folder_status(&self.snapshot.files, &self.pending_staging);
         match result.snapshot {
             Ok(snapshot) => self.apply_snapshot(self.repo.clone(), snapshot),
             Err(error) => self.error = Some(format!("Could not refresh repository: {error}")),
@@ -3314,6 +3726,7 @@ impl App {
 
     fn refresh(&mut self) {
         if self.busy.is_none() && self.snapshot_read.is_none() {
+            self.force_preview_refresh = true;
             self.snapshot_read = Some(self.read(ReadKind::Snapshot {
                 all_history: self.history_all,
             }));
@@ -3325,13 +3738,29 @@ impl App {
             && self.modal.is_none()
             && (self.loaded || self.error.is_none())
             && now.saturating_duration_since(self.last_refresh) >= Duration::from_secs(2)
+            && now.saturating_duration_since(self.last_input) >= Duration::from_millis(350)
+            && self.snapshot_read.is_none()
         {
-            self.refresh();
+            self.refresh_round = (self.refresh_round + 1) % 5;
+            if self.guard_stale
+                || self.refresh_round == 0
+                || self.workspace == Workspace::Worktrees
+                || !self.loaded
+            {
+                self.snapshot_read = Some(self.read(ReadKind::Snapshot {
+                    all_history: self.history_all,
+                }));
+            } else {
+                self.snapshot_read =
+                    Some(self.read(ReadKind::Refresh(Box::new(self.snapshot.clone()))));
+            }
         }
     }
 
     pub fn loading(&self) -> bool {
-        self.snapshot_read.is_some()
+        self.index_status_read.is_some()
+            || self.guard_read.is_some()
+            || self.snapshot_read.is_some()
             || self.preview_read.is_some()
             || self.detail_read.is_some()
             || self.commit_read.is_some()
@@ -3376,6 +3805,10 @@ impl App {
     }
 
     fn cancel_reads(&mut self) {
+        self.index_status_read = None;
+        self.guard_read = None;
+        self.after_guard = None;
+        self.force_preview_refresh = false;
         self.history_preferences = None;
         self.loader.clear();
         self.snapshot_read = None;
@@ -3387,6 +3820,22 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, repo: Repo, snapshot: Snapshot) {
+        self.guard_stale = false;
+        let force_preview = std::mem::take(&mut self.force_preview_refresh);
+        let same_state = self.loaded
+            && self.repo.root == repo.root
+            && self.snapshot.guard == snapshot.guard
+            && self.snapshot.all_history == snapshot.all_history;
+        if !force_preview
+            && (self.preview_valid || self.preview_loading)
+            && same_state
+            && self.workspace == Workspace::Files
+        {
+            self.snapshot = snapshot;
+            self.last_refresh = Instant::now();
+            return;
+        }
+        let previous_target = same_state.then(|| self.preview_target());
         self.mouse_position = None;
         self.show_path = false;
         let key = self.selected_key();
@@ -3403,6 +3852,7 @@ impl App {
         let previous_remotes = self.remote_tree.clone();
         self.repo = repo;
         self.snapshot = snapshot;
+        self.folder_status = tree::folder_status(&self.snapshot.files, &self.pending_staging);
         self.remote_tree = tree::remotes(&self.snapshot);
         self.remote_tree.restore_view(&previous_remotes);
         self.loaded = true;
@@ -3460,7 +3910,14 @@ impl App {
             }
         }
         self.last_refresh = Instant::now();
-        self.request_preview(retained.is_none());
+        let keep_preview = !force_preview
+            && same_state
+            && self.workspace != Workspace::Worktrees
+            && (self.preview_valid || self.preview_loading)
+            && previous_target.as_ref() == Some(&self.preview_target());
+        if !keep_preview {
+            self.request_preview(retained.is_none());
+        }
     }
 
     fn load_commit_preview(&mut self) {
@@ -3489,7 +3946,67 @@ impl App {
                     break;
                 }
             };
-            if self.snapshot_read == Some(response.id) {
+            if self.guard_read == Some(response.id) {
+                self.guard_read = None;
+                let pending = self.after_guard.take();
+                if !matches!(self.modal, Some(Modal::Loading(_))) {
+                    continue;
+                }
+                self.modal = None;
+                match response.result {
+                    Ok(ReadData::Snapshot(data)) => {
+                        let old = &self.snapshot.guard;
+                        let new = &data.1.guard;
+                        let metadata_changed = old.metadata_changed(new);
+                        let selected = self.selected_key();
+                        let (repo, snapshot) = *data;
+                        self.apply_snapshot(repo, snapshot);
+                        if metadata_changed
+                            || (selected.is_some() && selected != self.selected_key())
+                        {
+                            self.error = Some("Repository metadata or selection changed. Review the refreshed view and retry the action.".into());
+                        } else if let Some((command, input)) = pending
+                            && let Err(error) = self.prepare(command, input)
+                        {
+                            self.fail(error);
+                        }
+                    }
+                    Err(error) => {
+                        self.error = Some(format!("Could not validate repository: {error}"))
+                    }
+                    _ => {
+                        self.error =
+                            Some("Unexpected validation response; refresh before retrying.".into())
+                    }
+                }
+                changed = true;
+            } else if self.index_status_read == Some(response.id) {
+                self.index_status_read = None;
+                self.index_session = false;
+                self.index_scopes.clear();
+                self.busy = None;
+                self.pending_staging.clear();
+                self.folder_status =
+                    tree::folder_status(&self.snapshot.files, &self.pending_staging);
+                match response.result {
+                    Ok(ReadData::IndexStatus { scopes, files }) => {
+                        self.reconcile_index(scopes, files)
+                    }
+                    Err(error) => {
+                        self.pending_staging.clear();
+                        self.folder_status =
+                            tree::folder_status(&self.snapshot.files, &self.pending_staging);
+                        self.error = Some(format!(
+                            "Could not refresh index status: {error}. Press r to reconcile."
+                        ));
+                    }
+                    _ => {
+                        self.error =
+                            Some("Unexpected index status response; press r to reconcile.".into())
+                    }
+                }
+                changed = true;
+            } else if self.snapshot_read == Some(response.id) {
                 self.snapshot_read = None;
                 self.last_refresh = Instant::now();
                 match response.result {
@@ -3516,6 +4033,7 @@ impl App {
             } else if self.preview_read == Some(response.id) {
                 self.preview_read = None;
                 self.preview_loading = false;
+                self.preview_valid = matches!(&response.result, Ok(ReadData::Preview(_)));
                 self.preview = match response.result {
                     Ok(ReadData::Preview(text)) => text,
                     Err(error) => format!("Could not load preview:\n{error}"),
@@ -3599,6 +4117,7 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        self.last_input = Instant::now();
         if self.modal.is_none() && self.filters[self.workspace.index()].editing {
             let filter = &mut self.filters[self.workspace.index()];
             if filter.query.len() + text.len() <= 1024 {
@@ -3630,7 +4149,7 @@ impl App {
         }
         match &mut self.modal {
             Some(Modal::Commit(view)) => view.history.search.paste(text),
-            Some(Modal::Inline { editor, .. }) => {
+            Some(Modal::Inline { editor, .. } | Modal::CommitMessage { editor, .. }) => {
                 if let Err(error) = editor.paste(text) {
                     self.fail(error);
                 }
@@ -3667,6 +4186,162 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rapid_index_inputs_coalesce_and_last_toggle_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo {
+            root: dir.path().into(),
+        };
+        repo.bytes(&["init", "-b", "main"]).unwrap();
+        std::fs::write(dir.path().join("a"), "a").unwrap();
+        std::fs::write(dir.path().join("b"), "b").unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        }
+        assert_eq!(app.index_queue.len(), 1);
+        assert!(app.index_queue[0].staged);
+        assert!(app.pending_staging[Path::new("a")]);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.index_queue.len(), 1);
+        assert_eq!(
+            app.index_queue[0].scopes.len(),
+            2,
+            "adjacent stage inputs use one Git batch"
+        );
+        app.index_queue.clear();
+        app.enqueue_index(CommandId::StageAll).unwrap();
+        assert_eq!(
+            app.index_queue[0].scopes,
+            [PathBuf::from(".")],
+            "root staging must not enumerate every child"
+        );
+        assert!(app.guard_stale);
+        assert!(
+            app.guard_read.is_none(),
+            "staging must not start a full validation scan"
+        );
+    }
+
+    #[test]
+    fn cancelling_lazy_validation_never_executes_the_waiting_destructive_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo {
+            root: dir.path().into(),
+        };
+        repo.bytes(&["init", "-b", "main"]).unwrap();
+        std::fs::write(dir.path().join("a"), "keep me").unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
+        app.guard_stale = true;
+        app.prepare(CommandId::Discard, None).unwrap();
+        assert!(app.guard_read.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.guard_read.is_none() && app.after_guard.is_none());
+        let until = Instant::now() + Duration::from_millis(150);
+        while Instant::now() < until {
+            app.poll_loading();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.modal.is_none() && app.busy.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a")).unwrap(),
+            "keep me"
+        );
+    }
+
+    #[test]
+    fn mouse_motion_within_one_hover_target_does_not_request_redraws() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo {
+            root: dir.path().into(),
+        };
+        repo.bytes(&["init", "-b", "main"]).unwrap();
+        std::fs::write(dir.path().join("a"), "a").unwrap();
+        std::fs::write(dir.path().join("b"), "b").unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        let moved = |x, y| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!app.mouse_event(moved(5, 6)));
+        let started = app.hover_started;
+        assert!(!app.mouse_event(moved(6, 6)));
+        assert_eq!(
+            app.hover_started, started,
+            "motion within a row must not restart the delay"
+        );
+        app.hover_started = Some(Instant::now() - Duration::from_millis(250));
+        assert!(!app.tooltip_visible());
+        app.hover_started = Some(Instant::now() - Duration::from_millis(350));
+        assert!(app.tooltip_visible());
+        assert!(!app.mouse_event(moved(7, 6)));
+        assert!(app.mouse_event(moved(5, 7)));
+        assert!(
+            !app.tooltip_visible(),
+            "a different row starts a fresh 300 ms delay"
+        );
+        assert!(!app.mouse_event(moved(139, 20)));
+        assert!(!app.mouse_event(moved(138, 20)));
+        app.show_path = true;
+        assert!(
+            app.tooltip_visible(),
+            "keyboard path reveal stays immediate"
+        );
+    }
+
+    #[test]
+    fn unchanged_idle_refresh_reuses_preview_but_manual_refresh_reloads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo {
+            root: dir.path().into(),
+        };
+        repo.bytes(&["init", "-b", "main"]).unwrap();
+        std::fs::write(dir.path().join("a"), "a").unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
+        let original = app.preview.clone();
+        let previous_read = app.next_read;
+        let snapshot = app.snapshot.clone();
+        app.apply_snapshot(app.repo.clone(), snapshot);
+        assert_eq!(app.next_read, previous_read);
+        assert_eq!(app.preview, original);
+        app.force_preview_refresh = true;
+        app.apply_snapshot(app.repo.clone(), app.snapshot.clone());
+        assert!(app.next_read > previous_read);
+        app.last_refresh = Instant::now() - Duration::from_secs(3);
+        app.last_input = Instant::now();
+        app.auto_refresh(Instant::now());
+        assert!(
+            app.snapshot_read.is_none(),
+            "background refresh must wait for idle input"
+        );
+    }
+
+    #[test]
+    fn unchanged_refresh_does_not_restart_an_inflight_non_file_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo {
+            root: dir.path().into(),
+        };
+        repo.bytes(&["init", "-b", "main"]).unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
+        app.workspace = Workspace::Remotes;
+        app.preview_loading = true;
+        app.preview_valid = false;
+        let generation = app.next_read;
+        app.apply_snapshot(app.repo.clone(), app.snapshot.clone());
+        assert_eq!(
+            app.next_read, generation,
+            "idle snapshots must not repeatedly cancel a slow preview"
+        );
+        assert!(app.preview_loading);
+    }
 
     #[test]
     fn navigation_remains_available_while_a_preview_reader_is_blocked() {

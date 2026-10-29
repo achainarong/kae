@@ -191,7 +191,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
         );
         let panes = [geometry.list, geometry.preview];
         *app.geometry.borrow_mut() = geometry;
-        let visible = app.visible_items();
+        // Files has its own viewport renderer; do not build a second, unused list.
+        let visible = if app.workspace == Workspace::Files {
+            Vec::new()
+        } else {
+            app.visible_items()
+        };
         let heights = visible
             .iter()
             .map(|(_, item)| item.lines().count().max(1))
@@ -409,16 +414,9 @@ fn draw_workspace_preview(frame: &mut Frame, app: &App, area: Rect) {
             }
         });
         format!(
-            " {}{} ",
+            " {} ",
             path.map(|path| safe_text(&path.to_string_lossy()))
-                .unwrap_or_else(|| "Working tree".into()),
-            pending
-                .map(|staged| if staged {
-                    " · staging…"
-                } else {
-                    " · unstaging…"
-                })
-                .unwrap_or("")
+                .unwrap_or_else(|| "Working tree".into())
         )
     } else if app.workspace == Workspace::Remotes {
         " Remote / branch details · Enter expand/collapse ".into()
@@ -462,11 +460,29 @@ fn draw_workspace_preview(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
     let theme = &app.theme;
+    let height = usize::from(area.height.saturating_sub(2));
+    let mut state = app.explorer_state.borrow_mut();
+    state.select((!app.explorer.rows.is_empty()).then_some(app.explorer.cursor));
+    let mut offset = state
+        .offset()
+        .min(app.explorer.rows.len().saturating_sub(height.max(1)));
+    if !app.manual_list_scroll.get() && app.explorer.cursor < offset {
+        offset = app.explorer.cursor;
+    }
+    if !app.manual_list_scroll.get() && app.explorer.cursor >= offset + height.max(1) {
+        offset = app.explorer.cursor + 1 - height.max(1);
+    }
+    *state.offset_mut() = offset;
     let items = app
         .explorer
         .rows
         .iter()
+        .skip(offset)
+        .take(height)
         .map(|row| {
             let indent = "  ".repeat(
                 row.depth
@@ -475,8 +491,32 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
             let name = safe_text(&row.name.to_string_lossy());
             match row.file.and_then(|index| app.snapshot.files.get(index)) {
                 Some(file) => {
-                    let status = file.status.as_bytes();
                     let pending = app.pending_staging.get(&file.path).copied();
+                    let actual = file.status.as_bytes();
+                    let status = match pending {
+                        Some(true) => [
+                            if actual[0] == b'?' || actual[0] == b'A' {
+                                b'A'
+                            } else if !matches!(actual[1], b' ' | b'?') {
+                                actual[1]
+                            } else {
+                                actual[0]
+                            },
+                            b' ',
+                        ],
+                        Some(false) if matches!(actual[0], b'?' | b'A' | b'R' | b'C') => {
+                            [b'?', b'?']
+                        }
+                        Some(false) => [
+                            b' ',
+                            if actual[1] != b' ' {
+                                actual[1]
+                            } else {
+                                actual[0]
+                            },
+                        ],
+                        None => [actual[0], actual[1]],
+                    };
                     let staged = pending.unwrap_or(!matches!(status[0], b' ' | b'?'));
                     let color = if file.is_conflict() && pending.is_none() {
                         theme.deleted
@@ -485,7 +525,7 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
                     } else {
                         theme.text
                     };
-                    let index_color = if file.is_conflict() {
+                    let index_color = if file.is_conflict() && pending.is_none() {
                         theme.deleted
                     } else if staged {
                         theme.added
@@ -494,7 +534,7 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
                     } else {
                         theme.muted
                     };
-                    let worktree_color = if file.is_conflict() {
+                    let worktree_color = if file.is_conflict() && pending.is_none() {
                         theme.deleted
                     } else if status[1] == b'?' {
                         theme.warning
@@ -510,16 +550,8 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
                         Span::raw(indent),
                         Span::raw("  "),
                         Span::styled(
-                            if pending.is_some() {
-                                "·".into()
-                            } else {
-                                (status[0] as char).to_string()
-                            },
-                            Style::default().fg(if pending.is_some() {
-                                if staged { theme.added } else { theme.muted }
-                            } else {
-                                index_color
-                            }),
+                            (status[0] as char).to_string(),
+                            Style::default().fg(index_color),
                         ),
                         Span::styled(
                             (status[1] as char).to_string(),
@@ -530,22 +562,11 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
                     ]))
                 }
                 None => {
-                    let files = app
-                        .snapshot
-                        .files
-                        .iter()
-                        .filter(|file| file.path.starts_with(&row.path));
-                    let (mut staged, mut working) = (0, 0);
-                    for file in files {
-                        let status = file.status.as_bytes();
-                        if let Some(pending) = app.pending_staging.get(&file.path) {
-                            staged += usize::from(*pending);
-                            working += usize::from(!*pending);
-                        } else {
-                            staged += usize::from(!matches!(status[0], b' ' | b'?'));
-                            working += usize::from(status[1] != b' ');
-                        }
-                    }
+                    let (staged, working) = app
+                        .folder_status
+                        .get(&row.path)
+                        .copied()
+                        .unwrap_or_default();
                     let prefix = format!(
                         "{indent}{} ",
                         if app.explorer.collapsed.contains(&row.path) {
@@ -574,11 +595,11 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
             }
         })
         .collect::<Vec<_>>();
-    let selected = if items.is_empty() {
-        None
-    } else {
-        Some(app.explorer.cursor)
-    };
+    let selected = app
+        .explorer
+        .cursor
+        .checked_sub(offset)
+        .filter(|index| *index < items.len());
     let list = List::new(items)
         .block(panel(
             theme,
@@ -590,12 +611,17 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
         ))
         .highlight_style(Style::default().bg(theme.selection).bold())
         .highlight_symbol("› ");
-    let mut state = app.explorer_state.borrow_mut();
-    state.select(selected);
-    frame.render_stateful_widget(list, area, &mut *state);
+    frame.render_stateful_widget(
+        list,
+        area,
+        &mut ListState::default().with_selected(selected),
+    );
 }
 
 fn draw_path_tooltip(frame: &mut Frame, app: &App, tree: Rect) {
+    if !app.tooltip_visible() {
+        return;
+    }
     if !app.files_tree_visible() && !app.show_path {
         return;
     }
@@ -688,7 +714,16 @@ fn tail_name(name: &str, width: u16) -> String {
 
 fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
     let theme = &app.theme;
-    let area = if matches!(modal, Modal::Confirm { .. }) {
+    let area = if matches!(modal, Modal::CommitMessage { .. }) {
+        let width = area.width.saturating_sub(4).min(76);
+        let height = area.height.saturating_sub(2).min(12);
+        Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        )
+    } else if matches!(modal, Modal::Confirm { .. }) {
         let width = area.width.saturating_sub(4).min(90);
         let height = area.height.saturating_sub(2).min(20);
         Rect::new(
@@ -793,6 +828,25 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                 Some(*selected)
             });
             frame.render_stateful_widget(list, rows[1], &mut state);
+        }
+        Modal::CommitMessage { command, editor } => {
+            let title = if *command == crate::app::CommandId::Amend {
+                " Amend commit message "
+            } else {
+                " Commit message "
+            };
+            let block = panel(theme, title.into(), true);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+            frame.render_widget(&editor.area, chunks[0]);
+            frame.render_widget(
+                Paragraph::new(
+                    "Enter commit · Shift+Enter / Ctrl+J newline\nEsc cancel · paste supported",
+                )
+                .style(Style::default().fg(theme.muted)),
+                chunks[1],
+            );
         }
         Modal::Prompt { caption, input, .. } => {
             let text = format!(
@@ -1098,11 +1152,29 @@ fn draw_commit(app: &App, frame: &mut Frame, view: &crate::app::CommitView, area
     );
     let panes = [geometry.list, geometry.preview];
     *app.geometry.borrow_mut() = geometry;
+    let height = usize::from(panes[0].height.saturating_sub(2));
+    let mut state = view.list_state.borrow_mut();
+    let cursor = view.history.tree.cursor;
+    state.select((!view.history.tree.rows.is_empty()).then_some(cursor));
+    let mut offset = state
+        .offset()
+        .min(view.history.tree.rows.len().saturating_sub(height.max(1)));
+    if !app.manual_list_scroll.get() {
+        if cursor < offset {
+            offset = cursor;
+        }
+        if cursor >= offset + height.max(1) {
+            offset = cursor + 1 - height.max(1);
+        }
+    }
+    *state.offset_mut() = offset;
     let items = view
         .history
         .tree
         .rows
         .iter()
+        .skip(offset)
+        .take(height)
         .map(|row| {
             let indent = "  ".repeat(row.depth.min(32));
             match row.file.and_then(|index| view.commit.files.get(index)) {
@@ -1134,12 +1206,9 @@ fn draw_commit(app: &App, frame: &mut Frame, view: &crate::app::CommitView, area
             }
         })
         .collect::<Vec<_>>();
-    let mut state = view.list_state.borrow_mut();
-    state.select(if items.is_empty() {
-        None
-    } else {
-        Some(view.history.tree.cursor)
-    });
+    let selected = cursor
+        .checked_sub(offset)
+        .filter(|index| *index < items.len());
     frame.render_stateful_widget(
         List::new(items)
             .block(panel(
@@ -1150,7 +1219,7 @@ fn draw_commit(app: &App, frame: &mut Frame, view: &crate::app::CommitView, area
             .highlight_symbol("› ")
             .highlight_style(Style::default().bg(theme.selection).fg(theme.text).bold()),
         panes[0],
-        &mut *state,
+        &mut ListState::default().with_selected(selected),
     );
     app.geometry.borrow_mut().rows = (state.offset()..view.history.tree.rows.len())
         .take(usize::from(panes[0].height.saturating_sub(2)))

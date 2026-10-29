@@ -24,7 +24,7 @@ The saved script can be inspected before running. It detects your platform, down
 To pin a release or select another directory:
 
 ```sh
-KAE_INSTALL_DIR="$HOME/.local/bin" sh install-kae.sh v0.2.0
+KAE_INSTALL_DIR="$HOME/.local/bin" sh install-kae.sh v0.3.0
 ```
 
 ### Build from source
@@ -284,8 +284,8 @@ Each archive contains `kae` and has a matching `.sha256`; releases also include 
 For a maintainer-triggered release, first review/commit/push the intended changes and set the Cargo version. For the current version, the release commands are:
 
 ```sh
-git tag -a v0.2.0 -m "Kae 0.2.0"
-git push origin v0.2.0
+git tag -a v0.3.0 -m "Kae 0.3.0"
+git push origin v0.3.0
 ```
 
 Only tag reviewed code. The workflow files must already exist in that tagged commit, and GitHub Actions must be enabled. These commands are instructions, not actions performed by Kae. Hosted CI/release execution requires pushing the workflow; local validation cannot substitute for the first three-platform run.

@@ -1,13 +1,18 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    cell::RefCell,
+    collections::{BTreeMap, hash_map::DefaultHasher},
     ffi::OsString,
     fs::{self, File},
     hash::{Hash, Hasher},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -16,6 +21,33 @@ use crate::graph::{self, Commit};
 
 pub const OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
 pub const PREVIEW_LIMIT: usize = 256 * 1024;
+
+thread_local! {
+    // Installed only by read workers. Mutation workers never inherit it.
+    static READ_CANCEL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+pub fn cancellable_read<T>(cancel: Arc<AtomicBool>, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Arc<AtomicBool>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_CANCEL.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(READ_CANCEL.with(|slot| slot.replace(Some(cancel))));
+    read()
+}
+
+pub fn check_read_cancelled() -> Result<()> {
+    ensure!(
+        !READ_CANCEL.with(|slot| slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))),
+        "Read superseded by newer navigation"
+    );
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct Repo {
@@ -45,7 +77,7 @@ impl GitOutput {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileChange {
     pub status: String,
     pub path: PathBuf,
@@ -108,7 +140,7 @@ pub struct Stash {
     pub subject: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
@@ -129,7 +161,17 @@ pub struct Guard {
     files: Vec<(PathBuf, u64)>,
 }
 
-#[derive(Clone, Debug)]
+impl Guard {
+    pub fn metadata_changed(&self, other: &Self) -> bool {
+        self.head != other.head
+            || self.symbolic_head != other.symbolic_head
+            || self.operation != other.operation
+            || self.refs != other.refs
+            || self.remote_config != other.remote_config
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteBranch {
     pub remote: String,
     pub branch: String,
@@ -199,6 +241,43 @@ pub struct Action {
     pub guard: Guard,
 }
 
+/// Whole-file index intent. Unlike reviewed/destructive actions, this acts on
+/// current disk content and relies on Git's index lock, not a stale UI guard.
+#[derive(Clone, Debug, Default)]
+pub struct IndexRequest {
+    pub staged: bool,
+    pub bulk: bool,
+    pub scopes: Vec<PathBuf>,
+    pub rename_sources: Vec<PathBuf>,
+}
+
+impl IndexRequest {
+    pub fn covers(&self, path: &Path) -> bool {
+        self.scopes.iter().any(|scope| {
+            scope == Path::new(".") || scope.as_os_str().is_empty() || path.starts_with(scope)
+        })
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        for scope in other.scopes {
+            if self.covers(&scope) {
+                continue;
+            }
+            self.scopes
+                .retain(|old| scope != Path::new(".") && !old.starts_with(&scope));
+            self.scopes.push(scope);
+        }
+        self.rename_sources.extend(other.rename_sources);
+        let sources = std::mem::take(&mut self.rename_sources);
+        self.rename_sources = sources
+            .into_iter()
+            .filter(|path| !self.covers(path))
+            .collect();
+        self.rename_sources.sort();
+        self.rename_sources.dedup();
+    }
+}
+
 impl Action {
     pub fn new(snapshot: &Snapshot, label: impl Into<String>, args: &[&str]) -> Self {
         Self {
@@ -240,6 +319,162 @@ impl Action {
 }
 
 impl Repo {
+    fn scoped_bytes(&self, prefix: &[&str], scopes: &[PathBuf]) -> Result<Vec<u8>> {
+        ensure!(!scopes.is_empty(), "Select a staging scope");
+        let mut output = Vec::new();
+        let mut start = 0;
+        while start < scopes.len() {
+            let mut end = start;
+            let mut size = 0;
+            while end < scopes.len()
+                && (end == start || size + scopes[end].as_os_str().len() < 32 * 1024)
+            {
+                size += scopes[end].as_os_str().len() + 1;
+                end += 1;
+            }
+            let mut args = strings(prefix);
+            args.push("--".into());
+            args.extend(
+                scopes[start..end]
+                    .iter()
+                    .map(|path| path.as_os_str().to_owned()),
+            );
+            output.extend(self.checked(&args, None)?);
+            start = end;
+        }
+        Ok(output)
+    }
+
+    pub fn index_status(&self, scopes: &[PathBuf]) -> Result<Vec<FileChange>> {
+        let prefix = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+        // Status has no NUL-stdin pathspec interface. For an oversized selection,
+        // use one status scan and filter it rather than splitting rename pairs.
+        let output = if scopes
+            .iter()
+            .map(|path| path.as_os_str().len() + 1)
+            .sum::<usize>()
+            >= 32 * 1024
+        {
+            self.bytes(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?
+        } else {
+            self.scoped_bytes(&prefix, scopes)?
+        };
+        let selection = IndexRequest {
+            staged: false,
+            bulk: false,
+            scopes: scopes.to_vec(),
+            rename_sources: Vec::new(),
+        };
+        let files = parse_status(&output)?.into_iter().filter(|file| {
+            selection.covers(&file.path)
+                || file
+                    .original
+                    .as_ref()
+                    .is_some_and(|path| selection.covers(path))
+        });
+        Ok(files
+            .map(|file| (file.path.clone(), file))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect())
+    }
+
+    pub fn update_index(&self, request: &IndexRequest) -> Result<GitOutput> {
+        ensure!(
+            !request.scopes.is_empty(),
+            "Select files to stage or unstage"
+        );
+        let mut scopes = request.scopes.clone();
+        if request.staged && !request.rename_sources.is_empty() {
+            let names =
+                self.scoped_bytes(&["ls-files", "--cached", "-z"], &request.rename_sources)?;
+            let tracked = names
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .map(|name| os_bytes(name).map(PathBuf::from))
+                .collect::<Result<std::collections::HashSet<_>>>()?;
+            for source in &request.rename_sources {
+                // Resolve rename deletions against the live index: a queued
+                // unstage may have restored the old entry since the UI snapshot.
+                if tracked.contains(source)
+                    && matches!(self.root.join(source).symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    scopes.push(source.clone());
+                }
+            }
+        }
+        if request.staged {
+            let unmerged = self.scoped_bytes(
+                &[
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=U",
+                    "-z",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                ],
+                &scopes,
+            )?;
+            ensure!(
+                !request.bulk || unmerged.is_empty(),
+                "Resolve and stage conflicted files individually before staging this folder or root"
+            );
+            for name in unmerged
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+            {
+                let relative = PathBuf::from(os_bytes(name)?);
+                ensure!(
+                    request.covers(&relative),
+                    "Rename source {} is conflicted; resolve and stage it explicitly",
+                    relative.display()
+                );
+                let path = self.root.join(relative);
+                if path.is_file() && !path.is_symlink() {
+                    ensure!(
+                        !crate::conflict::contains_markers(&fs::read(&path)?),
+                        "Conflict markers remain in {}. Resolve and save before staging.",
+                        path.display()
+                    );
+                }
+            }
+        }
+        let args = if request.staged {
+            strings(&[
+                "add",
+                "--all",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ])
+        } else if let Some(head) = self.head()? {
+            // Pathspec mode resets only the selected index entries, never HEAD
+            // or working files, and treats already-unstaged paths as a no-op.
+            strings(&[
+                "reset",
+                "--quiet",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+                &head,
+            ])
+        } else {
+            strings(&[
+                "rm",
+                "--cached",
+                "-r",
+                "-f",
+                "--ignore-unmatch",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ])
+        };
+        let mut input = Vec::new();
+        for path in &scopes {
+            input.extend_from_slice(path.as_os_str().as_encoded_bytes());
+            input.push(0);
+        }
+        // No editor setup or global refs/config/content scan for index-only work.
+        self.run(&args, Some(&input))
+    }
     pub fn discover(path: &Path) -> Result<Self> {
         let probe = Self {
             root: path.to_owned(),
@@ -303,10 +538,12 @@ impl Repo {
                 "diff-tree",
                 "show",
                 "restore",
+                "reset",
                 "checkout",
                 "rm",
                 "clean",
                 "ls-files",
+                "status",
             ]
             .iter()
             .any(|name| arg == name)
@@ -318,6 +555,15 @@ impl Repo {
     }
 
     pub fn run_command(&self, command: &mut Command, input: Option<&[u8]>) -> Result<GitOutput> {
+        check_read_cancelled()?;
+        let cancel = READ_CANCEL.with(|slot| slot.borrow().clone());
+        #[cfg(unix)]
+        if cancel.is_some() {
+            use std::os::unix::process::CommandExt;
+            // Read-only helpers (including submodule Git children) belong to
+            // their own group. Never group or interrupt mutation processes.
+            command.process_group(0);
+        }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         if input.is_some() {
             command.stdin(Stdio::piped());
@@ -339,13 +585,39 @@ impl Repo {
         } else {
             Ok(())
         };
-        let status = child.wait()?;
+        let status = if let Some(cancel) = &cancel {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    #[cfg(unix)]
+                    {
+                        // std supports creating process groups, but not sending
+                        // group signals. Use the OS utility, without a shell or
+                        // unsafe FFI, and only target the group created above.
+                        let _ = Command::new("/bin/kill")
+                            .args(["-KILL", "--", &format!("-{}", child.id())])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                    }
+                    let _ = child.kill();
+                    break child.wait()?;
+                }
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        } else {
+            child.wait()?
+        };
         let (stdout, out_cut, stdout_fingerprint) = out
             .join()
             .map_err(|_| anyhow::anyhow!("Git stdout reader failed"))??;
         let (stderr, err_cut, _) = err
             .join()
             .map_err(|_| anyhow::anyhow!("Git stderr reader failed"))??;
+        check_read_cancelled()?;
         if status.success() {
             write_result.context("Could not send input to Git")?;
         }
@@ -758,6 +1030,76 @@ impl Repo {
         Ok(sections.join("\n\n"))
     }
 
+    pub fn folder_preview(
+        &self,
+        heading: &str,
+        path: &Path,
+        files: &[FileChange],
+    ) -> Result<String> {
+        fn append(text: &mut String, section: &str) -> bool {
+            let remaining = PREVIEW_LIMIT.saturating_sub(text.len());
+            if section.len() <= remaining {
+                text.push_str(section);
+                return true;
+            }
+            let mut end = remaining;
+            while !section.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.push_str(&section[..end]);
+            text.push_str(
+                "\n[Combined preview truncated at 256 KiB; select a file to inspect it.]\n",
+            );
+            false
+        }
+        let mut text = format!("{heading}\n{} changed files\n", files.len());
+        if files.iter().any(FileChange::is_conflict) {
+            append(
+                &mut text,
+                "\nUNRESOLVED CONFLICTS — select a conflicted file to resolve it.\n",
+            );
+        }
+        if files.iter().any(|file| file.status != "??") {
+            for (cached, title) in [(true, "STAGED"), (false, "WORKING TREE")] {
+                check_read_cancelled()?;
+                let mut args = strings(&["diff", "--no-ext-diff", "--no-textconv", "--no-color"]);
+                if cached {
+                    args.push("--cached".into());
+                }
+                args.push("--".into());
+                args.push(if path.as_os_str().is_empty() {
+                    OsString::from(".")
+                } else {
+                    path.as_os_str().into()
+                });
+                let output = self.run(&args, None)?;
+                ensure!(output.success, "{}", output.text());
+                if !output.stdout.is_empty()
+                    && !append(
+                        &mut text,
+                        &format!("\n── {title} ──\n\n{}\n", preview_text(&output.stdout)),
+                    )
+                {
+                    return Ok(text);
+                }
+            }
+        }
+        for file in files.iter().filter(|file| file.status == "??") {
+            check_read_cancelled()?;
+            let preview = self
+                .file_preview(file)
+                .unwrap_or_else(|error| format!("Could not preview this file: {error:#}"));
+            if !append(
+                &mut text,
+                &format!("\n── {} ──\n\n{preview}\n", file.path.display()),
+            ) {
+                break;
+            }
+        }
+        check_read_cancelled()?;
+        Ok(text)
+    }
+
     pub fn diff(&self, path: &Path, cached: bool) -> Result<Vec<u8>> {
         let mut args = strings(&["diff", "--no-ext-diff", "--no-textconv", "--no-color"]);
         if cached {
@@ -1017,6 +1359,7 @@ pub fn file_fingerprint(path: &Path) -> Result<u64> {
         let mut file = File::open(path)?;
         let mut buffer = [0; 8192];
         loop {
+            check_read_cancelled()?;
             let count = file.read(&mut buffer)?;
             if count == 0 {
                 break;

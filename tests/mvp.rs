@@ -1096,6 +1096,399 @@ fn ui_stage_commit_and_destructive_confirmation_flow() {
 }
 
 #[test]
+fn commit_dialog_pastes_edits_and_submits_multiline_messages() {
+    let fixture = Fixture::new();
+    fixture.write("file", "content\n");
+    fixture.success(&["add", "."]);
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('c'));
+    assert!(matches!(app.modal, Some(app::Modal::CommitMessage { .. })));
+    app.handle_paste("Résumé 🦀\r\n\r\nBody");
+    assert!(app.busy.is_none());
+    assert!(
+        fixture.repo.head().unwrap().is_none(),
+        "paste must not submit"
+    );
+    key(&mut app, KeyCode::Home);
+    app.handle_paste("Edited ");
+    key(&mut app, KeyCode::End);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+    app.handle_paste("Another line");
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    app.handle_paste("Last line");
+    let terminal = draw_at(&app, 140, 40);
+    let buffer = terminal.backend().buffer();
+    let text = buffer
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("Commit message") && text.contains("Shift+Enter"));
+    assert!(
+        !(0..140).any(|x| buffer[(x, 0)].symbol() == "┌"),
+        "dialog is not fullscreen"
+    );
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_eq!(
+        fixture.repo.text(&["log", "-1", "--format=%B"]).unwrap(),
+        "Résumé 🦀\n\nEdited Body\nAnother line\nLast line"
+    );
+}
+
+#[test]
+fn commit_dialog_empty_cancel_and_unsafe_paste_never_commit() {
+    let fixture = Fixture::new();
+    fixture.write("file", "content\n");
+    fixture.success(&["add", "."]);
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('c'));
+    app.handle_paste(" \n ");
+    key(&mut app, KeyCode::Enter);
+    assert!(app.error.is_some() && matches!(app.modal, Some(app::Modal::CommitMessage { .. })));
+    app.handle_paste("\x1b[31munsafe");
+    assert!(
+        matches!(&app.modal, Some(app::Modal::CommitMessage { editor, .. }) if !editor.text().contains("unsafe"))
+    );
+    key(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none() && app.busy.is_none());
+    assert!(fixture.repo.head().unwrap().is_none());
+    assert_eq!(fixture.repo.text(&["ls-files"]).unwrap(), "file");
+}
+
+#[test]
+fn amend_dialog_prefills_message_and_retains_confirmation() {
+    let fixture = Fixture::new();
+    let head = fixture.commit("file", "content\n", "Original subject\n\nOriginal body");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char(':'));
+    app.handle_paste("amend");
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::CommitMessage { editor, .. }) if editor.text().contains("Original body"))
+    );
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
+    key(&mut app, KeyCode::Esc);
+    assert_eq!(fixture.repo.head().unwrap().unwrap(), head);
+}
+
+#[test]
+fn fast_staging_uses_current_target_content_without_scanning_unrelated_changes() {
+    let fixture = Fixture::new();
+    fixture.write("other", "base other\n");
+    fixture.commit("target", "base\n", "base");
+    fixture.write("target", "seen\n");
+    fixture.write("other", "seen other\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    let target = app
+        .snapshot
+        .files
+        .iter()
+        .position(|file| file.path == Path::new("target"))
+        .unwrap();
+    app.explorer.select_file(target);
+    app.selected = target;
+    fixture.write("target", "latest content\n");
+    fixture.write("other", "unrelated external edit\n");
+    fixture.success(&["branch", "unrelated-ref"]);
+    key(&mut app, KeyCode::Char('s'));
+    wait(&mut app);
+    assert!(app.error.is_none(), "{:?}", app.error);
+    let staged = fixture.repo.text(&["diff", "--cached"]).unwrap();
+    assert!(staged.contains("+latest content") && !staged.contains("unrelated external edit"));
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("other")).unwrap(),
+        "unrelated external edit\n"
+    );
+}
+
+#[test]
+fn root_stage_then_queued_file_unstage_preserves_order_and_working_files() {
+    let fixture = Fixture::new();
+    fixture.write("src/a", "base a\n");
+    let head = fixture.commit("src/b", "base b\n", "base");
+    fixture.write("src/a", "changed a\n");
+    fixture.write("src/b", "changed b\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('S'));
+    app.poll_worker(); // Start the root batch before the next user intent.
+    let target = app
+        .snapshot
+        .files
+        .iter()
+        .position(|file| file.path == Path::new("src/a"))
+        .unwrap();
+    app.explorer.select_file(target);
+    app.selected = target;
+    key(&mut app, KeyCode::Char('u'));
+    assert_eq!(app.pending_staging.get(Path::new("src/a")), Some(&false));
+    wait(&mut app);
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_eq!(
+        fixture
+            .repo
+            .text(&["diff", "--cached", "--name-only"])
+            .unwrap(),
+        "src/b"
+    );
+    assert_eq!(fixture.repo.head().unwrap().unwrap(), head);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("src/a")).unwrap(),
+        "changed a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("src/b")).unwrap(),
+        "changed b\n"
+    );
+}
+
+#[test]
+fn fast_unstage_of_an_already_unstaged_literal_path_is_a_safe_noop() {
+    let fixture = Fixture::new();
+    let head = fixture.base();
+    fixture.write("[folder]/line\nbreak", "keep\n");
+    let request = git::IndexRequest {
+        staged: false,
+        bulk: false,
+        scopes: vec!["[folder]/line\nbreak".into()],
+        rename_sources: Vec::new(),
+    };
+    assert!(fixture.repo.update_index(&request).unwrap().success);
+    assert_eq!(fixture.repo.head().unwrap().unwrap(), head);
+    assert!(
+        fixture
+            .repo
+            .bytes(&["diff", "--cached"])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("[folder]/line\nbreak")).unwrap(),
+        "keep\n"
+    );
+}
+
+#[test]
+fn queued_rename_toggles_resolve_sources_against_the_live_index() {
+    let fixture = Fixture::new();
+    let head = fixture.commit("old", &"rename content\n".repeat(20), "base");
+    fixture.success(&["mv", "old", "new"]);
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('u'));
+    app.poll_worker();
+    key(&mut app, KeyCode::Char(' ')); // Re-stage while the unstage is still in flight.
+    wait(&mut app);
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_eq!(fixture.repo.text(&["ls-files"]).unwrap(), "new");
+    assert!(
+        app.snapshot
+            .files
+            .iter()
+            .any(|file| file.path == Path::new("new")
+                && file.original.as_deref() == Some(Path::new("old")))
+    );
+    key(&mut app, KeyCode::Char('u'));
+    key(&mut app, KeyCode::Char(' '));
+    key(&mut app, KeyCode::Char(' '));
+    wait(&mut app);
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_eq!(fixture.repo.text(&["ls-files"]).unwrap(), "old");
+    assert_eq!(fixture.repo.head().unwrap().unwrap(), head);
+    assert!(fixture.repo.root.join("new").exists() && !fixture.repo.root.join("old").exists());
+}
+
+#[test]
+fn fast_stage_display_is_green_without_pending_dots_or_labels() {
+    let fixture = Fixture::new();
+    fixture.write("a", "a\n");
+    fixture.write("b", "b\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('s'));
+    let terminal = draw_at(&app, 140, 40);
+    let buffer = terminal.backend().buffer();
+    let rendered = buffer
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!rendered.contains("staging…") && !rendered.contains("unstaging…"));
+    let row = (5..38)
+        .find(|y| {
+            (0..40)
+                .any(|x| buffer[(x, *y)].symbol() == "a" && buffer[(x, *y)].fg == app.theme.added)
+        })
+        .unwrap();
+    assert!(
+        !(1..40).any(|x| buffer[(x, row)].symbol() == "·"),
+        "no optimistic marker in the file row"
+    );
+    wait(&mut app);
+}
+
+#[test]
+#[ignore = "Manual staging performance comparison in an isolated repository"]
+fn profile_fast_index_batches() {
+    let fixture = Fixture::new();
+    for index in 0..1000 {
+        fixture.write(&format!("src/file-{index:04}"), "base\n");
+    }
+    let head = fixture.commit("README", "base\n", "base");
+    for index in 0..128 {
+        fixture.write(&format!("src/file-{index:04}"), &"changed\n".repeat(1024));
+    }
+    let snapshot = fixture.repo.snapshot().unwrap();
+    let started = Instant::now();
+    assert!(
+        fixture
+            .repo
+            .execute(&Action::new(
+                &snapshot,
+                "Guarded root stage",
+                &["add", "--all"]
+            ))
+            .unwrap()
+            .success
+    );
+    fixture.repo.refresh_index(&snapshot).unwrap();
+    let guarded = started.elapsed();
+    let mut request = git::IndexRequest {
+        staged: false,
+        bulk: true,
+        scopes: vec![".".into()],
+        rename_sources: Vec::new(),
+    };
+    assert!(fixture.repo.update_index(&request).unwrap().success);
+    request.staged = true;
+    let started = Instant::now();
+    assert!(fixture.repo.update_index(&request).unwrap().success);
+    let status = fixture.repo.index_status(&request.scopes).unwrap();
+    let fast = started.elapsed();
+    assert_eq!(status.len(), 128);
+    assert!(status.iter().all(|file| file.status == "M "));
+    assert_eq!(fixture.repo.head().unwrap().unwrap(), head);
+    eprintln!(
+        "PROFILE root staging (128 changes / 1,000 files): old guarded stage+refresh={guarded:?}; fast batch+status={fast:?}; speedup={:.1}x",
+        guarded.as_secs_f64() / fast.as_secs_f64()
+    );
+}
+
+#[test]
+#[ignore = "Manual performance comparison; isolated temporary repository only"]
+fn profile_batched_folder_previews_and_viewport_rendering() {
+    let fixture = Fixture::new();
+    for index in 0..64 {
+        fixture.write(
+            &format!("src/feature-{}/file-{index:04}", index % 8),
+            "base\n",
+        );
+    }
+    fixture.commit("README", "base\n", "base");
+    for index in 0..64 {
+        fixture.write(
+            &format!("src/feature-{}/file-{index:04}", index % 8),
+            &format!("changed-{index:04}\n"),
+        );
+    }
+    let snapshot = fixture.repo.snapshot().unwrap();
+    let started = Instant::now();
+    for file in &snapshot.files {
+        fixture.repo.file_preview(file).unwrap();
+    }
+    let sequential = started.elapsed();
+    let started = Instant::now();
+    let preview = fixture
+        .repo
+        .folder_preview("src", Path::new("src"), &snapshot.files)
+        .unwrap();
+    let batched = started.elapsed();
+    assert!(preview.contains("changed-0000") && preview.contains("changed-0063"));
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    // Rendering cost should be independent of the number of offscreen files.
+    app.snapshot.files = (0..10_000)
+        .map(|index| git::FileChange {
+            path: format!("src/feature-{}/file-{index:05}", index % 100).into(),
+            status: " M".into(),
+            original: None,
+        })
+        .collect();
+    app.explorer = tree::explorer(&app.snapshot.files, &app.repo.root);
+    app.folder_status = tree::folder_status(&app.snapshot.files, &app.pending_staging);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+    let started = Instant::now();
+    for _ in 0..50 {
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    }
+    let render = started.elapsed();
+    eprintln!(
+        "PROFILE folder files=64 sequential={sequential:?}; batched={batched:?}; speedup={:.1}x; 50 viewport renders with 10,000 changed files={render:?}",
+        sequential.as_secs_f64() / batched.as_secs_f64()
+    );
+}
+
+#[test]
+fn batched_folder_paths_remain_literal_and_read_cancellation_never_leaks_into_mutations() {
+    let fixture = Fixture::new();
+    fixture.write("[group]/a", "base\n");
+    fixture.commit("group/a", "base\n", "base");
+    fixture.write("[group]/a", "literal change\n");
+    fixture.write("group/a", "unrelated change\n");
+    let snapshot = fixture.repo.snapshot().unwrap();
+    let files = snapshot
+        .files
+        .iter()
+        .filter(|file| file.path.starts_with("[group]"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let preview = fixture
+        .repo
+        .folder_preview("[group]", Path::new("[group]"), &files)
+        .unwrap();
+    assert!(preview.contains("+literal change") && !preview.contains("unrelated change"));
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    assert!(git::cancellable_read(cancel, || fixture.repo.text(&["status", "--short"])).is_err());
+    // This runs on the normal mutation path, with all guard checks intact.
+    let action = Action::new(&snapshot, "Stage literal", &["add"]).path(Path::new("[group]/a"));
+    assert!(fixture.repo.execute(&action).unwrap().success);
+    assert!(
+        fixture
+            .repo
+            .text(&["diff", "--cached"])
+            .unwrap()
+            .contains("+literal change")
+    );
+}
+
+#[test]
+fn viewport_rendering_preserves_global_file_row_indices() {
+    let fixture = Fixture::new();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    app.snapshot.files = (0..10_000)
+        .map(|index| git::FileChange {
+            path: format!("src/file-{index:05}").into(),
+            status: " M".into(),
+            original: None,
+        })
+        .collect();
+    app.explorer = tree::explorer(&app.snapshot.files, &app.repo.root);
+    app.folder_status = tree::folder_status(&app.snapshot.files, &app.pending_staging);
+    app.explorer.select_file(9_999);
+    app.selected = 9_999;
+    draw_at(&app, 140, 40);
+    let geometry = app.geometry.borrow();
+    assert!(geometry.rows.len() <= usize::from(geometry.list.height.saturating_sub(2)));
+    assert!(
+        geometry
+            .rows
+            .last()
+            .is_some_and(|index| app.explorer.rows[*index].file == Some(9_999))
+    );
+    assert!(app.explorer_state.borrow().offset() > 9_000);
+}
+
+#[test]
 fn history_defaults_to_compact_head_scope_and_retains_toggles_and_selection() {
     let fixture = Fixture::new();
     let base = fixture.base();
@@ -1556,6 +1949,129 @@ fn clicks_select_scrolled_files_commits_and_graph_connector_rows_without_writes(
 }
 
 #[test]
+fn file_wheel_scrolls_viewport_without_selection_or_preview_changes() {
+    use crossterm::event::{
+        MouseButton::Left,
+        MouseEventKind::{Down, ScrollDown, ScrollUp},
+    };
+    let fixture = Fixture::new();
+    for index in 0..60 {
+        fixture.write(&format!("file-{index:02}"), &format!("content {index}\n"));
+    }
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    wait(&mut app);
+    draw_at(&app, 140, 30);
+    let geometry = app.geometry.borrow().clone();
+    let selected = app.selected;
+    let cursor = app.explorer.cursor;
+    let preview = app.preview.clone();
+    let before = fixture.repo.guard().unwrap();
+    for _ in 0..25 {
+        mouse(
+            &mut app,
+            ScrollDown,
+            geometry.list.x + 5,
+            geometry.list.y + 2,
+        );
+        draw_at(&app, 140, 30);
+    }
+    let scrolled = app.geometry.borrow().clone();
+    assert!(
+        scrolled.rows[0] > cursor,
+        "selected row can scroll out of view"
+    );
+    assert_eq!(app.selected, selected);
+    assert_eq!(app.explorer.cursor, cursor);
+    assert_eq!(app.preview, preview);
+    assert!(!app.loading(), "scrolling must not start a preview read");
+    assert_eq!(scrolled.rows.last(), Some(&(app.explorer.rows.len() - 1)));
+    mouse(&mut app, ScrollUp, geometry.list.x + 5, geometry.list.y + 2);
+    draw_at(&app, 140, 30);
+    assert_eq!(app.geometry.borrow().rows[0], scrolled.rows[0] - 3);
+    // Hit-testing must use the scrolled viewport, not the selected row.
+    let row = app.geometry.borrow().rows[0];
+    let expected = app.explorer.rows[row].file.unwrap();
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 5,
+        geometry.list.y + 1,
+    );
+    wait(&mut app);
+    assert_eq!(app.selected, expected);
+    assert_eq!(app.explorer.cursor, row);
+    mouse(&mut app, ScrollUp, geometry.list.x + 5, geometry.list.y + 2);
+    key(&mut app, KeyCode::Down);
+    draw_at(&app, 140, 30);
+    assert_eq!(app.explorer.cursor, row + 1);
+    assert!(app.geometry.borrow().rows.contains(&app.explorer.cursor));
+    for _ in 0..25 {
+        mouse(&mut app, ScrollUp, geometry.list.x + 5, geometry.list.y + 2);
+    }
+    draw_at(&app, 140, 30);
+    assert_eq!(app.geometry.borrow().rows[0], 0);
+    draw_at(&app, 140, 60); // Resize while the selected row is offscreen.
+    assert_eq!(app.selected, expected + 1);
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
+fn commit_file_wheel_preserves_selected_file_and_preview() {
+    use crossterm::event::{
+        MouseButton::Left,
+        MouseEventKind::{Down, ScrollDown, ScrollUp},
+    };
+    let fixture = Fixture::new();
+    for index in 0..60 {
+        fixture.write(&format!("file-{index:02}"), "content\n");
+    }
+    fixture.commit("last", "last\n", "many files");
+    let mut app = open_history(&fixture);
+    draw_at(&app, 140, 30);
+    let geometry = app.geometry.borrow().clone();
+    let (selected, cursor, preview) = match &app.modal {
+        Some(app::Modal::Commit(view)) => (
+            view.selected,
+            view.history.tree.cursor,
+            view.preview.clone(),
+        ),
+        _ => unreachable!(),
+    };
+    for _ in 0..25 {
+        mouse(
+            &mut app,
+            ScrollDown,
+            geometry.list.x + 5,
+            geometry.list.y + 2,
+        );
+        draw_at(&app, 140, 30);
+    }
+    assert!(app.geometry.borrow().rows[0] > cursor);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.selected == selected && view.history.tree.cursor == cursor && view.preview == preview)
+    );
+    assert!(!app.loading());
+    let offset = app.geometry.borrow().rows[0];
+    mouse(&mut app, ScrollUp, geometry.list.x + 5, geometry.list.y + 2);
+    draw_at(&app, 140, 30);
+    assert_eq!(app.geometry.borrow().rows[0], offset - 3);
+    let row = app.geometry.borrow().rows[0];
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 5,
+        geometry.list.y + 1,
+    );
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.tree.cursor == row && view.selected != selected)
+    );
+    key(&mut app, KeyCode::Down);
+    draw_at(&app, 140, 30);
+    assert!(app.geometry.borrow().rows.contains(&(row + 1)));
+}
+
+#[test]
 fn dividers_drag_resize_with_shortcuts_and_restore_without_overwriting_other_settings() {
     use crossterm::event::{
         MouseButton::Left,
@@ -1939,6 +2455,7 @@ fn path_tooltips_reveal_full_names_by_keyboard_and_hover_without_selecting() {
         .into_owned();
     // First visible tree row, accounting for the header, tabs and border.
     app.mouse_position = Some((5, 5));
+    app.hover_started = Some(Instant::now() - Duration::from_millis(350));
     terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
     assert!(text(&terminal).contains("Full path"));
     assert!(
