@@ -12,6 +12,8 @@ mod editor;
 mod git;
 #[path = "../src/graph.rs"]
 mod graph;
+#[path = "../src/history.rs"]
+mod history;
 #[path = "../src/loader.rs"]
 mod loader;
 #[path = "../src/rebase.rs"]
@@ -1536,6 +1538,443 @@ fn historical_full_file_navigation_can_reach_beyond_u16_line_offsets() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(screen.contains("70000 x"));
+}
+
+fn open_history(fixture: &Fixture) -> app::App {
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    assert!(matches!(app.modal, Some(app::Modal::Commit(_))));
+    app
+}
+
+fn navigation_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    let original = (0..70)
+        .map(|index| format!("line {index}\n"))
+        .collect::<String>();
+    fixture.write("src/a.rs", &original);
+    fixture.write("src/nested/b.rs", "old beta\n");
+    fixture.commit("zz-root.txt", "old root\n", "base");
+    fixture.write(
+        "src/a.rs",
+        &original
+            .replace("line 2\n", "needle café\n")
+            .replace("line 55\n", "needle 雪\n"),
+    );
+    fixture.write("src/nested/b.rs", "beta needle\n");
+    fixture.commit("zz-root.txt", "new root\n", "changes");
+    fixture
+}
+
+#[test]
+fn history_tree_shortcuts_search_and_scroll_survive_view_switches() {
+    let fixture = navigation_fixture();
+    let guard = fixture.repo.guard().unwrap();
+    let mut app = open_history(&fixture);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.commit.files[view.selected].path == Path::new("src/nested/b.rs"))
+    );
+    key(&mut app, KeyCode::Char(']'));
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.commit.files[view.selected].path == Path::new("src/a.rs"))
+    );
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("NEEDLE");
+    key(&mut app, KeyCode::Enter);
+    let first = match &app.modal {
+        Some(app::Modal::Commit(view)) => {
+            assert_eq!(view.history.search.matches.len(), 2);
+            assert_eq!(view.history.search.active, Some(0));
+            view.scroll
+        }
+        _ => panic!(),
+    };
+    key(&mut app, KeyCode::Char('d'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.scroll == first && view.history.split(140, false))
+    );
+    key(&mut app, KeyCode::Char('n'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.search.active == Some(1) && view.scroll > first)
+    );
+    key(&mut app, KeyCode::Char('N'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.search.active == Some(0) && view.scroll == first)
+    );
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("missing");
+    key(&mut app, KeyCode::Esc);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.search.query == "NEEDLE" && view.scroll == first)
+    );
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('}'));
+    key(&mut app, KeyCode::Char('l'));
+    let position = match &app.modal {
+        Some(app::Modal::Commit(view)) => (view.scroll, view.horizontal),
+        _ => panic!(),
+    };
+    key(&mut app, KeyCode::Char(']'));
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.focus == app::Focus::Preview && view.commit.files[view.selected].path == Path::new("zz-root.txt"))
+    );
+    key(&mut app, KeyCode::Char('['));
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if (view.scroll, view.horizontal) == position)
+    );
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('h'));
+    key(&mut app, KeyCode::Char('h'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.tree.collapsed.contains(Path::new("src")) && view.commit.files[view.selected].path == Path::new("src/a.rs"))
+    );
+    key(&mut app, KeyCode::Char(']'));
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('['));
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if !view.history.tree.collapsed.contains(Path::new("src")))
+    );
+    render_views(&app);
+    fixture.repo.verify(&guard).unwrap();
+}
+
+#[test]
+fn split_diffs_render_real_line_numbers_matches_and_narrow_fallback() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let fixture = navigation_fixture();
+    let mut app = open_history(&fixture);
+    key(&mut app, KeyCode::Char(']'));
+    wait(&mut app);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('d'));
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("needle");
+    key(&mut app, KeyCode::Enter);
+    for (width, height) in [(140, 40), (100, 30), (60, 24)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("needle"),
+            "match is not visible at width {width}"
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.bg == ratatui::style::Color::LightMagenta)
+        );
+        if width >= 120 {
+            assert!(text.contains("Old · parent") && text.contains("New · commit"));
+        } else {
+            assert!(!text.contains("Old · parent") && text.contains("unified"));
+        }
+    }
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.layout == history::DiffLayout::SideBySide)
+    );
+    key(&mut app, KeyCode::Char('t'));
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.full && view.history.search.matches.len() == 2 && view.history.layout == history::DiffLayout::SideBySide)
+    );
+    key(&mut app, KeyCode::Char('t'));
+    wait(&mut app);
+    assert!(matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.split(140, false)));
+}
+
+#[test]
+fn search_can_reach_long_utf8_lines_and_pasted_shortcuts_remain_literal() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let fixture = Fixture::new();
+    fixture.commit(
+        "file",
+        &format!("{}雪 café NEEDLE\n", "x".repeat(100_000)),
+        "long line",
+    );
+    let before = fixture.repo.guard().unwrap();
+    let mut app = open_history(&fixture);
+    key(&mut app, KeyCode::Char('t'));
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("CAFÉ");
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.horizontal > usize::from(u16::MAX) && view.history.search.matches.len() == 1)
+    );
+    let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .contains("café")
+    );
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("q]d/y");
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.search.query == "CAFÉq]d/y" && view.history.search.matches.is_empty())
+    );
+    assert!(app.busy.is_none());
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
+fn parent_switch_preserves_active_file_collapsed_folder_layout_and_search() {
+    let fixture = Fixture::new();
+    fixture.commit("src/shared", "base\n", "base");
+    fixture.success(&["switch", "-c", "side"]);
+    fixture.commit("src/shared", "side\n", "side");
+    fixture.success(&["switch", "main"]);
+    fixture.commit("src/shared", "main\n", "main");
+    assert!(!fixture.action(&["merge", "--no-edit", "side"]).success);
+    fixture.write("src/shared", "combined\n");
+    fixture.success(&["add", "."]);
+    fixture.success(&["commit", "-m", "merge"]);
+    let mut app = open_history(&fixture);
+    key(&mut app, KeyCode::Char('d'));
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("combined");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('h'));
+    key(&mut app, KeyCode::Char('h'));
+    key(&mut app, KeyCode::Char('P'));
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.commit.parent == 1 && view.commit.files[view.selected].path == Path::new("src/shared") && view.history.tree.collapsed.contains(Path::new("src")) && view.history.layout == history::DiffLayout::SideBySide && view.history.search.query == "combined" && view.history.search.matches.len() == 1)
+    );
+}
+
+#[test]
+fn exact_historical_file_selection_excludes_directory_descendants() {
+    let fixture = Fixture::new();
+    fixture.commit("foo", &"old file\n".repeat(20), "file");
+    fs::remove_file(fixture.repo.root.join("foo")).unwrap();
+    fixture.write("foo/child", "unrelated child\n");
+    fixture.commit("foo/other", "other child\n", "directory");
+    let commit = fixture.repo.commit_files("HEAD", 0).unwrap();
+    let deleted = commit
+        .files
+        .iter()
+        .position(|file| file.path == Path::new("foo"))
+        .unwrap();
+    let preview = fixture
+        .repo
+        .historical_preview(&commit, deleted, false)
+        .unwrap();
+    assert!(
+        preview.contains("-old file")
+            && !preview.contains("+unrelated child")
+            && !preview.contains("+other child")
+    );
+
+    let fixture = Fixture::new();
+    fixture.commit("foo", "rename content\n", "base");
+    fs::remove_file(fixture.repo.root.join("foo")).unwrap();
+    fixture.write("foo/child", "rename content\n");
+    fixture.commit(
+        "foo/other",
+        "unrelated sibling\n",
+        "rename into old directory name",
+    );
+    let commit = fixture.repo.commit_files("HEAD", 0).unwrap();
+    let renamed = commit
+        .files
+        .iter()
+        .position(|file| file.original.as_deref() == Some(Path::new("foo")))
+        .unwrap();
+    let preview = fixture
+        .repo
+        .historical_preview(&commit, renamed, false)
+        .unwrap();
+    assert!(preview.contains("rename from foo") && preview.matches("diff --git").count() == 1);
+    assert!(!preview.contains("unrelated sibling"));
+}
+
+#[test]
+fn exact_historical_pathspecs_escape_globs_unicode_and_leading_special_characters() {
+    let fixture = Fixture::new();
+    let names = [
+        "[a]*?.rs",
+        "]leading.rs",
+        "!bang.rs",
+        "^caret.rs",
+        "-dash.rs",
+        "\\slash.rs",
+        "☃.rs",
+        ":(glob)*.rs",
+        "nested/quoted[?].rs",
+    ];
+    for (index, name) in names.iter().enumerate() {
+        fixture.write(name, &format!("unique-{index}\n"));
+    }
+    fixture.success(&["add", "."]);
+    fixture.success(&["commit", "-m", "paths"]);
+    let commit = fixture.repo.commit_files("HEAD", 0).unwrap();
+    for (index, name) in names.iter().enumerate() {
+        let selected = commit
+            .files
+            .iter()
+            .position(|file| file.path == Path::new(name))
+            .unwrap();
+        let preview = fixture
+            .repo
+            .historical_preview(&commit, selected, false)
+            .unwrap();
+        assert!(
+            preview.contains(&format!("+unique-{index}")),
+            "wrong preview for {name}: {preview}"
+        );
+        assert_eq!(
+            preview.matches("+unique-").count(),
+            1,
+            "unrelated file included for {name}"
+        );
+    }
+}
+
+#[test]
+fn history_rapid_file_changes_keep_the_final_document_and_query() {
+    let fixture = navigation_fixture();
+    let before = fixture.repo.guard().unwrap();
+    let mut app = open_history(&fixture);
+    for _ in 0..12 {
+        key(&mut app, KeyCode::Char(']'));
+        key(&mut app, KeyCode::Char(']'));
+        key(&mut app, KeyCode::Char('['));
+        key(&mut app, KeyCode::Char('['));
+    }
+    key(&mut app, KeyCode::Char(']'));
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("needle");
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.commit.files[view.selected].path == Path::new("src/a.rs") && view.history.search.matches.len() == 2 && view.history.document.can_split() && !view.preview.contains("beta needle") && view.history.document.lines.join("\n") == view.preview.trim_end_matches('\n'))
+    );
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
+fn history_empty_and_binary_commits_have_safe_fallback_navigation() {
+    let fixture = Fixture::new();
+    fixture.base();
+    fixture.success(&["commit", "--allow-empty", "-m", "empty"]);
+    let before = fixture.repo.guard().unwrap();
+    let mut app = open_history(&fixture);
+    for code in [
+        KeyCode::Char('d'),
+        KeyCode::Char(']'),
+        KeyCode::Char('['),
+        KeyCode::Home,
+        KeyCode::End,
+        KeyCode::Enter,
+    ] {
+        key(&mut app, code);
+    }
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.commit.files.is_empty() && !view.history.document.can_split())
+    );
+    render_views(&app);
+    fixture.repo.verify(&before).unwrap();
+
+    fs::write(fixture.repo.root.join("binary"), b"binary\0payload").unwrap();
+    fixture.success(&["add", "."]);
+    fixture.success(&["commit", "-m", "binary"]);
+    let mut app = open_history(&fixture);
+    key(&mut app, KeyCode::Char('d'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if !view.history.document.can_split() && view.history.layout == history::DiffLayout::SideBySide && view.preview.contains("Binary files"))
+    );
+    render_views(&app);
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_historical_pathspecs_preserve_non_utf8_bytes_where_the_filesystem_allows() {
+    use std::os::unix::ffi::OsStringExt;
+    let fixture = Fixture::new();
+    let name = OsString::from_vec(b"\xff-first".to_vec());
+    match fs::write(fixture.repo.root.join(&name), "raw byte content\n") {
+        Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => return,
+        result => result.unwrap(),
+    }
+    fixture.success(&["add", "."]);
+    fixture.success(&["commit", "-m", "raw path"]);
+    let commit = fixture.repo.commit_files("HEAD", 0).unwrap();
+    assert_eq!(commit.files[0].path.as_os_str(), &name);
+    assert!(
+        fixture
+            .repo
+            .historical_preview(&commit, 0, false)
+            .unwrap()
+            .contains("+raw byte content")
+    );
+}
+
+#[test]
+fn searching_eof_annotations_keeps_the_match_visible_when_toggling_layouts() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let fixture = Fixture::new();
+    fixture.commit("file", &format!("{}old", "x".repeat(5000)), "base");
+    fixture.commit("file", &format!("{}new", "x".repeat(5000)), "update");
+    let mut app = open_history(&fixture);
+    app.screen_width = 140;
+    key(&mut app, KeyCode::Char('d'));
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("No newline");
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.horizontal > 4000 && view.history.search.matches.len() == 2)
+    );
+    let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.bg == ratatui::style::Color::LightMagenta)
+            .count()
+            >= 10
+    );
+    key(&mut app, KeyCode::Char('n'));
+    key(&mut app, KeyCode::Char('d'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.horizontal == 0 && view.history.search.active == Some(1))
+    );
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.bg == ratatui::style::Color::LightMagenta)
+            .count()
+            >= 10
+    );
 }
 
 #[cfg(unix)]

@@ -14,6 +14,7 @@ use anyhow::Result;
 use crate::{
     conflict::Conflict,
     git::{CommitFiles, FileChange, Guard, Hunks, Repo, Snapshot, Worktree},
+    history::HistoricalPreview,
     rebase::Plan,
 };
 
@@ -66,7 +67,7 @@ pub enum ReadData {
     Output { title: String, text: String },
     AmendMessage(String),
     Commit(CommitFiles),
-    CommitPreview(String),
+    CommitPreview(Box<HistoricalPreview>),
 }
 
 pub struct Request {
@@ -244,7 +245,10 @@ fn execute(repo: Repo, kind: ReadKind) -> Result<ReadData> {
             commit,
             index,
             full,
-        } => ReadData::CommitPreview(repo.historical_preview(&commit, index, full)?),
+        } => ReadData::CommitPreview(Box::new(HistoricalPreview::new(
+            repo.historical_preview(&commit, index, full)?,
+            full,
+        ))),
     })
 }
 

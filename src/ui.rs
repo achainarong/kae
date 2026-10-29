@@ -11,6 +11,7 @@ use crate::{
     app::{App, Focus, Modal, Workspace},
     conflict::{Choice, Conflict},
     git::Hunks,
+    history::{CellKind, DiffCell, DiffLayout, Search},
     rebase::{Plan, RebaseAction},
 };
 
@@ -221,6 +222,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 " Quit requested — waiting for Git to finish safely."
             } else if app.busy.is_some() {
                 " Git is running · ? help · q / Ctrl-C quit after completion"
+            } else if matches!(app.modal, Some(Modal::Commit(_))) {
+                " History browser · read only · Esc returns to history · [/] file · / find · d layout"
             } else {
                 " : commands · ? help · Tab focus · r refresh · !/~ details · q quit"
             }),
@@ -239,7 +242,30 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
         ),
         Modal::Help { scroll } => {
             frame.render_widget(Paragraph::new(
-                "Navigate: 1–7 workspace · [/] previous/next · Tab list/preview\nj/k or arrows move · h/l scroll horizontally · PgUp/PgDn scroll\n\nFiles: s stage · u unstage · S/U all · v hunks · e external editor\nEnter on conflict: resolve · c commit · a amend\nBranches: Enter switch · b new branch\nHistory: Enter files · j/k select · Tab diff · t full file · P parent\nHistory / branches / tags: m preview merge · M merge\nHistory: i interactive rebase (selected commit is the base)\nRemotes: f fetch · p pull fast-forward only · P push\nOperation: C review continue · A review abort · : skip / integration review\n\n: or / opens searchable commands, including stash/tag/worktree actions.\nPrompts: type, Backspace, Ctrl-U clear, Enter accept, Esc cancel.\nConfirmations: only typed y proceeds; n / Esc cancels. Paste never confirms.\nConflicts: 1 current · 2 incoming · 3 current+incoming · 4 reverse\nn/p region · u undo · b base · s review save · a stage · e inline · E external\nInline: type / arrows · Ctrl-Z undo · Ctrl-Y redo · Ctrl-S review save\nEsc keeps the inline draft; it does not write or discard it.\nRebase: j/k select · J/K reorder · p/r/s/f/d/e actions · Enter review\n\nr refresh (also automatic every 2s outside dialogs) · ~ output · q close/quit\nNetwork auth must be configured externally; no automatic force pushes."
+                concat!(
+                    "Navigate: 1–7 workspace · [/] workspace · Tab list/preview\n",
+                    "j/k or arrows move · h/l horizontal · PgUp/PgDn scroll\n\n",
+                    "Files: s/u stage/unstage · S/U all · v hunks · e external editor\n",
+                    "Enter on conflict: resolve · c commit · a amend\n",
+                    "Branches: Enter switch · b new branch\n",
+                    "History: Enter file tree · Enter folder/file · h/l collapse/expand\n",
+                    "Inside a commit: [/] file · {/} hunk · / text search · n/N match\n",
+                    "d unified/split · t full file · Tab focus · P merge parent\n",
+                    "History / branches / tags: m preview merge · M merge\n",
+                    "History: i interactive rebase (selected commit is the base)\n",
+                    "Remotes: f review fetch · p pull fast-forward only · P push\n",
+                    "Operation: C review continue · A review abort · : skip / review\n\n",
+                    ": or / opens command search in the main view.\n",
+                    "Prompts: type · Backspace · Ctrl-U clear · Enter accept · Esc cancel\n",
+                    "Confirmations: only typed y proceeds; n / Esc cancels.\n",
+                    "Conflicts: 1 current · 2 incoming · 3 both · 4 reverse\n",
+                    "n/p region · u undo · b base · s review save · a stage · e inline · E external\n",
+                    "Inline: Ctrl-Z undo · Ctrl-Y redo · Ctrl-S review save\n",
+                    "Esc keeps the inline draft without writing it.\n",
+                    "Rebase: j/k select · J/K reorder · p/r/s/f/d/e actions · Enter review\n\n",
+                    "r refresh (also automatic every 2s outside dialogs) · ~ output · q close/quit\n",
+                    "Network auth must be configured externally; no automatic force pushes."
+                )
             ).wrap(Wrap { trim: false }).scroll((*scroll, 0)).block(panel(" Help · j/k scroll · Esc close ".into(), true)), area);
         }
         Modal::Palette { filter, selected } => {
@@ -486,83 +512,386 @@ fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
             &view.commit.parents[view.commit.parent][..10]
         )
     };
+    let side_by_side = view.history.split(area.width, view.full);
+    let layout = if view.history.loading {
+        "loading"
+    } else if view.full {
+        "full file"
+    } else if side_by_side {
+        "side by side"
+    } else if view.history.layout == DiffLayout::SideBySide {
+        view.history
+            .document
+            .split_note
+            .unwrap_or("unified · widen to 120 columns for split")
+    } else {
+        "unified"
+    };
+    let path = view
+        .commit
+        .files
+        .get(view.selected)
+        .map(|file| safe_text(&file.path.to_string_lossy()))
+        .unwrap_or_default();
+    let search = &view.history.search;
+    let matches = if search.query.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " · /{} {}/{}{}",
+            safe_text(&search.query),
+            search.active.map(|index| index + 1).unwrap_or(0),
+            search.matches.len(),
+            if search.matches.is_empty() && !view.history.loading {
+                " (no matches)"
+            } else {
+                ""
+            }
+        )
+    };
     frame.render_widget(
         Paragraph::new(format!(
-            " {} {}\n {} · read only",
+            " {} {}\n {} · {} · {}{}",
             &view.commit.oid[..10],
             safe_text(&view.commit.subject),
-            parent
+            parent,
+            layout,
+            path,
+            matches
         ))
         .style(Style::default().fg(ACCENT)),
         rows[0],
     );
     let panes = split(rows[1], 32);
     let items = view
-        .commit
-        .files
+        .history
+        .tree
+        .rows
         .iter()
-        .map(|file| {
-            ListItem::new(format!(
-                "{} {}{}",
-                file.status,
-                safe_text(&file.path.to_string_lossy()),
-                file.original
-                    .as_ref()
-                    .map(|path| format!(" ← {}", safe_text(&path.to_string_lossy())))
-                    .unwrap_or_default()
-            ))
+        .map(|row| {
+            let indent = "  ".repeat(row.depth.min(32));
+            match row.file.and_then(|index| view.commit.files.get(index)) {
+                Some(file) => ListItem::new(format!(
+                    "{indent}{} {} {}{}",
+                    if row.file == Some(view.selected) {
+                        "●"
+                    } else {
+                        " "
+                    },
+                    file.status,
+                    safe_text(&row.name.to_string_lossy()),
+                    file.original
+                        .as_ref()
+                        .map(|path| format!(" ← {}", safe_text(&path.to_string_lossy())))
+                        .unwrap_or_default()
+                )),
+                None => ListItem::new(format!(
+                    "{indent}{} {}/ ({})",
+                    if view.history.tree.collapsed.contains(&row.path) {
+                        "▸"
+                    } else {
+                        "▾"
+                    },
+                    safe_text(&row.name.to_string_lossy()),
+                    row.count
+                ))
+                .style(Style::default().fg(ACCENT)),
+            }
         })
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(if items.is_empty() {
         None
     } else {
-        Some(view.selected)
+        Some(view.history.tree.cursor)
     });
     frame.render_stateful_widget(
         List::new(items)
-            .block(panel(" Changed files ".into(), view.focus == Focus::List))
+            .block(panel(
+                " Changed files · folders ".into(),
+                view.focus == Focus::List,
+            ))
             .highlight_symbol("› ")
             .highlight_style(Style::default().bg(Color::DarkGray).bold()),
         panes[0],
         &mut state,
     );
-    let height = usize::from(panes[1].height.saturating_sub(2));
-    let text = if view.full {
-        Text::from(
-            view.preview
-                .lines()
-                .enumerate()
-                .skip(view.scroll)
-                .take(height)
-                .map(|(index, line)| Line::raw(format!("{:>5} {}", index + 1, safe_text(line))))
-                .collect::<Vec<_>>(),
-        )
+    if view.history.loading {
+        frame.render_widget(
+            Paragraph::new("Loading file…").block(panel(" File preview ".into(), true)),
+            panes[1],
+        );
+    } else if side_by_side {
+        let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(panes[1]);
+        let start = view.history.document.row_for(view.scroll);
+        for (left, column) in [(true, columns[0]), (false, columns[1])] {
+            let lines = view
+                .history
+                .document
+                .rows
+                .iter()
+                .skip(start)
+                .take(usize::from(column.height.saturating_sub(2)))
+                .map(|row| {
+                    split_line(
+                        if left {
+                            row.left.as_ref()
+                        } else {
+                            row.right.as_ref()
+                        },
+                        search,
+                        view.horizontal,
+                        column.width.saturating_sub(2),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let title = if left && view.commit.parents.is_empty() {
+                " Old · empty tree "
+            } else if left {
+                " Old · parent "
+            } else {
+                " New · commit "
+            };
+            frame.render_widget(
+                Paragraph::new(lines).block(panel(title.into(), view.focus == Focus::Preview)),
+                column,
+            );
+        }
     } else {
-        diff_window(
-            &view.preview,
-            view.scroll,
-            panes[1].height.saturating_sub(2),
-        )
-    };
-    let title = if !view.full {
-        " File diff "
-    } else if view
-        .commit
-        .files
-        .get(view.selected)
-        .is_some_and(|file| file.status == "D")
-    {
-        " Full file · parent version (deleted in commit) "
+        let lines = view
+            .history
+            .document
+            .lines
+            .iter()
+            .enumerate()
+            .skip(view.scroll)
+            .take(usize::from(panes[1].height.saturating_sub(2)))
+            .map(|(source, line)| {
+                let prefix = if view.full {
+                    Span::styled(format!("{:>5} ", source + 1), Style::default().fg(MUTED))
+                } else {
+                    Span::raw("")
+                };
+                let style = if view.full {
+                    Style::default()
+                } else {
+                    patch_style(line)
+                };
+                presentation_line(
+                    prefix,
+                    highlighted(line, source, 0, search, style),
+                    view.horizontal,
+                    panes[1].width.saturating_sub(2),
+                )
+            })
+            .collect::<Vec<_>>();
+        let title = if !view.full {
+            " File diff · unified "
+        } else if view
+            .commit
+            .files
+            .get(view.selected)
+            .is_some_and(|file| file.status == "D")
+        {
+            " Full file · parent version (deleted) "
+        } else {
+            " Full file · committed version "
+        };
+        frame.render_widget(
+            Paragraph::new(lines).block(panel(title.into(), view.focus == Focus::Preview)),
+            panes[1],
+        );
+    }
+    let footer = if let Some(input) = &search.editing {
+        let input = format!("{}▏", safe_text(input));
+        let offset = Span::raw(&input)
+            .width()
+            .saturating_sub(usize::from(area.width.saturating_sub(1)));
+        vec![
+            presentation_line(Span::raw("/"), vec![Span::raw(input)], offset, area.width),
+            Line::raw("Enter find · Ctrl-U clear · Esc cancel · literal, case-insensitive"),
+        ]
+    } else if !search.query.is_empty() {
+        vec![
+            Line::raw(format!(
+                "{} · /{} · n/N match · / edit",
+                if search.matches.is_empty() && !view.history.loading {
+                    "No matches".into()
+                } else {
+                    format!(
+                        "Match {}/{}",
+                        search.active.map(|index| index + 1).unwrap_or(0),
+                        search.matches.len()
+                    )
+                },
+                safe_text(&search.query)
+            )),
+            Line::raw("[/] file · d unified/split · t full · Tab focus · Esc back"),
+        ]
     } else {
-        " Full file · committed version "
+        vec![
+            Line::raw("j/k move · h/l tree/scroll · Enter open · [/] file · Tab focus"),
+            Line::raw("/ find · n/N match · {/} hunk · d split · t full · P parent · Esc back"),
+        ]
     };
-    frame.render_widget(
-        Paragraph::new(text)
-            .scroll((0, view.horizontal))
-            .block(panel(title.into(), view.focus == Focus::Preview)),
-        panes[1],
+    frame.render_widget(Paragraph::new(footer), rows[2]);
+}
+
+fn patch_style(line: &str) -> Style {
+    Style::default().fg(if line.starts_with("+++") || line.starts_with("---") {
+        ACCENT
+    } else if line.starts_with('+') {
+        Color::Green
+    } else if line.starts_with('-') {
+        Color::Red
+    } else if line.starts_with("@@") {
+        Color::Magenta
+    } else {
+        Color::Reset
+    })
+}
+
+fn match_style(active: bool) -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(if active {
+            Color::LightMagenta
+        } else {
+            Color::Yellow
+        })
+        .bold()
+}
+
+fn highlighted(
+    text: &str,
+    source: usize,
+    prefix: usize,
+    search: &Search,
+    base: Style,
+) -> Vec<Span<'static>> {
+    let matches = search.on_line(source);
+    if matches.is_empty() {
+        return vec![Span::styled(safe_text(text), base)];
+    }
+    let mut spans = Vec::new();
+    let mut offset = prefix;
+    let mut index = 0;
+    let mut run = String::new();
+    let mut run_style = base;
+    let span = Span::raw(text);
+    for grapheme in span.styled_graphemes(base) {
+        let end = offset + grapheme.symbol.len();
+        while index < matches.len() && matches[index].bytes.end <= offset {
+            index += 1;
+        }
+        let matching = matches
+            .get(index)
+            .is_some_and(|matched| matched.bytes.start < end);
+        let active = search.current().is_some_and(|matched| {
+            matched.line == source && matched.bytes.start < end && matched.bytes.end > offset
+        });
+        let style = if matching {
+            base.patch(match_style(active))
+        } else {
+            base
+        };
+        if style != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        }
+        run_style = style;
+        run.push_str(&safe_text(grapheme.symbol));
+        offset = end;
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
+    }
+    spans
+}
+
+fn split_line(
+    cell: Option<&DiffCell>,
+    search: &Search,
+    horizontal: usize,
+    width: u16,
+) -> Line<'static> {
+    let Some(cell) = cell else {
+        return Line::raw("");
+    };
+    let color = match cell.kind {
+        CellKind::Delete => Color::Red,
+        CellKind::Insert => Color::Green,
+        CellKind::Hunk => Color::Magenta,
+        CellKind::Meta => MUTED,
+        CellKind::Context => Color::Reset,
+    };
+    let base = Style::default().fg(color);
+    let sign = match cell.kind {
+        CellKind::Delete => "-",
+        CellKind::Insert => "+",
+        _ => " ",
+    };
+    let prefix_style = search
+        .on_line(cell.source)
+        .iter()
+        .find(|matched| cell.prefix > 0 && matched.bytes.start < cell.prefix)
+        .map(|matched| match_style(search.current() == Some(matched)))
+        .unwrap_or(Style::default().fg(MUTED));
+    let prefix = Span::styled(
+        format!(
+            "{:>5} {sign} ",
+            cell.number
+                .map(|number| number.to_string())
+                .unwrap_or_default()
+        ),
+        prefix_style,
     );
-    frame.render_widget(Paragraph::new("j/k select file or scroll · Tab / Enter focus diff · h/l horizontal · n/p hunk\nt toggle full file / diff · P compare another merge parent · Esc / q history"), rows[2]);
+    let mut spans = highlighted(&cell.text, cell.source, cell.prefix, search, base);
+    if let Some((source, annotation)) = &cell.annotation {
+        spans.push(Span::raw("  "));
+        spans.extend(highlighted(
+            annotation,
+            *source,
+            0,
+            search,
+            Style::default().fg(MUTED),
+        ));
+    }
+    presentation_line(prefix, spans, horizontal, width)
+}
+
+/// Crop by displayed graphemes, not bytes or u16 offsets. Gutters remain fixed
+/// even when a search result is far into a long UTF-8 line.
+fn presentation_line(
+    prefix: Span<'static>,
+    spans: Vec<Span<'static>>,
+    offset: usize,
+    width: u16,
+) -> Line<'static> {
+    let available = usize::from(width).saturating_sub(prefix.width());
+    let mut visible = vec![prefix];
+    let mut column = 0usize;
+    let end = offset.saturating_add(available);
+    'spans: for span in spans {
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let size = Span::raw(grapheme.symbol).width();
+            if column >= end {
+                break 'spans;
+            }
+            let next = column.saturating_add(size);
+            if next > offset {
+                if column < offset || next > end {
+                    visible.push(Span::styled(
+                        " ".repeat(next.min(end).saturating_sub(column.max(offset))),
+                        grapheme.style,
+                    ));
+                } else {
+                    visible.push(Span::styled(grapheme.symbol.to_owned(), grapheme.style));
+                }
+            }
+            column = next;
+        }
+    }
+    Line::from(visible)
 }
 
 fn draw_hunks(frame: &mut Frame, hunks: &Hunks, area: Rect) {
@@ -779,6 +1108,48 @@ pub fn safe_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_highlights_whole_graphemes_and_long_lines_crop_without_u16_limits() {
+        use crate::history::Document;
+        let text = "e\u{301} 👩\u{200d}💻 雪";
+        let document = Document::full(text);
+        let mut search = Search {
+            query: "👩".into(),
+            ..Search::default()
+        };
+        search.reindex(&document, 0);
+        let spans = highlighted(text, 0, 0, &search, Style::default());
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content.contains("👩\u{200d}💻")
+                    && span.style.bg == Some(Color::LightMagenta))
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            text
+        );
+        let text = format!("{}NEEDLE 雪", "x".repeat(100_000));
+        search.query = "needle".into();
+        search.reindex(&Document::full(&text), 0);
+        let line = presentation_line(
+            Span::raw(" 1234 "),
+            highlighted(&text, 0, 0, &search, Style::default()),
+            100_000,
+            32,
+        );
+        let shown = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(shown.starts_with(" 1234 NEEDLE"));
+        assert!(line.width() <= 32);
+    }
     use crate::git::Repo;
     use ratatui::{Terminal, backend::TestBackend};
 

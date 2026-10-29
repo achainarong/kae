@@ -55,7 +55,7 @@ Launch `kae` inside a repository or use `-C` / `--path`. Subdirectories and link
 | Key | Workspace | Features |
 | --- | --- | --- |
 | `1` | Files | Status, staged/unstaged diffs, text previews, file/hunk staging, commit, amend, external editor, confirmed discard |
-| `2` | History | Commit graph, changed-file browser, per-file diffs/full contents, compare, cherry-pick, revert, interactive rebase |
+| `2` | History | Commit graph, expandable file tree, searchable unified/split diffs and full contents, compare, cherry-pick, revert, interactive rebase |
 | `3` | Branches | Create, switch, rename, safe deletion, compare, merge preview, merge |
 | `4` | Remotes | Fetch, explicit pull strategy, non-forced push, upstream setup, ahead/behind status |
 | `5` | Stashes | Save including untracked files, inspect, apply, pop, drop |
@@ -93,17 +93,21 @@ Wide terminals use side-by-side panes; narrower terminals stack them. Main navig
 
 ## Browse a commit by file
 
-In **History**, select a commit and press **Enter** to open its changed-file list rather than navigating one combined patch.
+In **History**, select a commit and press **Enter** to open its changed files as a folder tree rather than navigating one combined patch.
 
-- `j` / `k` selects a file; its individual diff loads in the other pane.
-- `Tab` switches file-list/diff focus; Enter focuses the diff.
-- In the diff, `j` / `k`, PageUp/PageDown, and `h` / `l` scroll; `n` / `p` jumps between hunks.
-- `t` toggles the diff and full historical file with line numbers.
-- Merge commits initially compare against the first parent; `P` cycles parents.
+- In the tree, `j` / `k` moves between folders/files. Enter toggles a folder or focuses the selected file's diff. Right/`l` expands a folder; Left/`h` collapses it or moves to its parent.
+- Folders show their changed-file count. The `●` marks the active file; collapsing its folder does not change the preview or lose its position.
+- `Tab` switches tree/diff focus. **`[` / `]` selects the previous/next file without leaving the diff**, revealing collapsed ancestors as needed. It stops at the first/last file rather than wrapping.
+- In the diff, `j` / `k`, PageUp/PageDown, Home/End, and `h` / `l` scroll. **`{` / `}` jumps between hunks** (replacing the old `n` / `p` shortcuts in this view).
+- **`d` toggles unified and side-by-side diffs.** Split view aligns old/new lines and shows their actual line numbers, with blank cells for missing lines. A terminal narrower than 120 columns falls back to unified without changing the preference. Binary, metadata-only, or incomplete/truncated patches also stay unified; Kae does not invent missing content.
+- **`/` searches the current diff/full file.** Enter finds literal, case-insensitive text and focuses the preview; `n` / `N` moves forward/backward with wraparound. Matches are highlighted, the current one has a distinct color, and the search status shows its position/count. Search includes loaded patch metadata, not line-number gutters. Unicode and regex punctuation are treated literally.
+- While entering a query, Backspace edits, Ctrl-U clears, and Esc cancels without changing the existing search or scroll position. An empty accepted query clears highlights. Pasted shortcuts are text, never actions. Queries are limited to 1,024 bytes and search only the loaded preview, not undisplayed portions of a large file or other files.
+- `t` toggles the diff and full historical file with line numbers. Search and layout preferences persist between files/modes; scroll positions are remembered separately per file and mode while the commit is open. An active search jumps to a match in the newly loaded content.
+- Merge commits initially compare against the first parent; `P` cycles parents, retaining the active path when present, folder state, focus, layout, full-file mode, and query. Positions reset because the comparison may have changed.
 - Root commits compare against the empty tree. Deleted files show their parent version in full-file mode; renames include both paths.
 - Esc / `q` returns to history, retaining the selected commit.
 
-Historical browsing is read-only: it never checks out a file, changes the index, or replaces working content. Large file previews are capped at 256 KiB.
+Historical browsing is read-only: it never checks out a file, changes the index, or replaces working content. Large file previews are capped at 256 KiB. Diff alignment is prepared by the background loader and only visible rows are rendered, including on long Unicode lines.
 
 ## Merge and resolve
 

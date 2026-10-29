@@ -18,6 +18,7 @@ use crate::{
     conflict::{Choice, Conflict},
     editor,
     git::{Action, CommitFiles, GitOutput, Hunks, Repo, Snapshot},
+    history::{DiffLayout, HistoricalPreview, History, Position, Preferences},
     loader::{Loader, Preview, ReadData, ReadKind, Request},
     rebase::{Plan, RebaseAction},
     ui,
@@ -284,7 +285,193 @@ pub struct CommitView {
     pub full: bool,
     pub preview: String,
     pub scroll: usize,
-    pub horizontal: u16,
+    pub horizontal: usize,
+    pub history: History,
+}
+
+impl CommitView {
+    fn new(commit: CommitFiles, preferences: Option<Preferences>) -> Self {
+        let mut history = History::new(&commit.files);
+        let mut selected = history
+            .tree
+            .selected()
+            .and_then(|row| row.file)
+            .unwrap_or(0);
+        let mut full = false;
+        let mut focus = Focus::List;
+        if let Some(preferences) = preferences {
+            selected = preferences
+                .active
+                .and_then(|path| commit.files.iter().position(|file| file.path == path))
+                .unwrap_or(selected);
+            history
+                .tree
+                .restore_collapsed(preferences.collapsed, selected, preferences.cursor);
+            history.layout = preferences.layout;
+            history.search.query = preferences.query;
+            full = preferences.full;
+            focus = if preferences.preview_focus {
+                Focus::Preview
+            } else {
+                Focus::List
+            };
+        }
+        Self {
+            commit,
+            selected,
+            focus,
+            full,
+            preview: String::new(),
+            scroll: 0,
+            horizontal: 0,
+            history,
+        }
+    }
+
+    fn preferences(&self) -> Preferences {
+        Preferences {
+            collapsed: self.history.tree.collapsed.clone(),
+            active: self
+                .commit
+                .files
+                .get(self.selected)
+                .map(|file| file.path.clone()),
+            layout: self.history.layout,
+            full: self.full,
+            query: self.history.search.query.clone(),
+            cursor: self
+                .history
+                .tree
+                .selected()
+                .map(|row| (row.path.clone(), row.file.is_none())),
+            preview_focus: self.focus == Focus::Preview,
+        }
+    }
+
+    fn remember(&mut self) {
+        if !self.history.loading
+            && let Some(file) = self.commit.files.get(self.selected)
+        {
+            self.history.positions.insert(
+                (file.path.clone(), self.full),
+                Position {
+                    source: self.scroll,
+                    horizontal: self.horizontal,
+                },
+            );
+        }
+    }
+
+    fn select(&mut self, index: usize) -> bool {
+        if self.selected == index {
+            return false;
+        }
+        self.remember();
+        self.selected = index;
+        self.history.tree.select_file(index);
+        true
+    }
+
+    fn start_loading(&mut self) {
+        let position = self
+            .commit
+            .files
+            .get(self.selected)
+            .and_then(|file| self.history.positions.get(&(file.path.clone(), self.full)))
+            .copied()
+            .unwrap_or_default();
+        self.scroll = position.source;
+        self.horizontal = position.horizontal;
+        self.preview = "Loading file…".into();
+        self.history.loading = true;
+        self.history.document = Default::default();
+        self.history
+            .search
+            .reindex(&self.history.document, self.scroll);
+    }
+
+    fn loaded(&mut self, preview: HistoricalPreview, width: u16) {
+        self.preview = preview.text;
+        self.history.document = preview.document;
+        self.history.loading = false;
+        self.scroll = self
+            .scroll
+            .min(self.history.document.lines.len().saturating_sub(1));
+        self.history
+            .search
+            .reindex(&self.history.document, self.scroll);
+        self.jump_to_match(width);
+    }
+
+    fn jump_to_match(&mut self, width: u16) {
+        if let Some(matched) = self.history.search.current() {
+            self.scroll = matched.line;
+            if let Some(line) = self.history.document.lines.get(matched.line) {
+                let display_width =
+                    |text: &str| ratatui::text::Span::raw(ui::safe_text(text)).width();
+                let mut column = display_width(&line[..matched.bytes.start]);
+                if self.history.split(width, self.full)
+                    && let Some(row) = self
+                        .history
+                        .document
+                        .rows
+                        .get(self.history.document.row_for(matched.line))
+                {
+                    for cell in row.left.iter().chain(row.right.iter()) {
+                        if cell.source == matched.line {
+                            column = display_width(
+                                &cell.text[..matched.bytes.start.saturating_sub(cell.prefix)],
+                            );
+                            break;
+                        }
+                        if let Some((source, annotation)) = &cell.annotation
+                            && *source == matched.line
+                        {
+                            column = display_width(&cell.text)
+                                + 2
+                                + display_width(&annotation[..matched.bytes.start]);
+                            break;
+                        }
+                    }
+                }
+                self.horizontal = column.saturating_sub(8);
+            }
+        }
+    }
+
+    fn edit_search(&mut self, key: KeyEvent, width: u16) {
+        let search = &mut self.history.search;
+        match key.code {
+            KeyCode::Esc => search.editing = None,
+            KeyCode::Enter => {
+                search.accept(&self.history.document, self.scroll);
+                if !search.query.is_empty() {
+                    self.focus = Focus::Preview;
+                }
+                self.jump_to_match(width);
+            }
+            KeyCode::Backspace => {
+                if let Some(input) = &mut search.editing {
+                    input.pop();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = &mut search.editing {
+                    input.clear();
+                }
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && !character.is_control() =>
+            {
+                if let Some(input) = &mut search.editing
+                    && input.len() + character.len_utf8() <= 1024
+                {
+                    input.push(character);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub enum PromptKind {
@@ -352,6 +539,8 @@ pub struct App {
     pub loaded: bool,
     pub preview_loading: bool,
     pub confirm_scroll: u16,
+    pub screen_width: u16,
+    history_preferences: Option<Preferences>,
     loader: Loader,
     next_read: u64,
     snapshot_read: Option<u64>,
@@ -389,6 +578,8 @@ impl App {
             loaded: false,
             preview_loading: false,
             confirm_scroll: 0,
+            screen_width: 120,
+            history_preferences: None,
             loader: Loader::new(),
             next_read: 0,
             snapshot_read: None,
@@ -464,6 +655,7 @@ impl App {
                 redraw = true;
             }
             if redraw {
+                self.update_width(terminal.size()?.width);
                 terminal.draw(|frame| ui::draw(frame, self))?;
                 redraw = false;
             }
@@ -472,6 +664,7 @@ impl App {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let size = terminal.size()?;
+                        self.update_width(size.width);
                         let (width, height) = ui::minimum_size(self);
                         if (size.width < width || size.height < height)
                             && !matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
@@ -492,6 +685,9 @@ impl App {
                             self.handle_paste(&text);
                         }
                     }
+                    Event::Resize(width, _) => {
+                        self.update_width(width);
+                    }
                     Event::Mouse(mouse) if self.modal.is_none() && self.busy.is_none() => {
                         match mouse.kind {
                             event::MouseEventKind::ScrollDown => self.navigate(3),
@@ -504,6 +700,21 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn update_width(&mut self, width: u16) {
+        if let Some(Modal::Commit(view)) = &mut self.modal
+            && view.history.split(width, view.full)
+                != view.history.split(self.screen_width, view.full)
+            && view
+                .history
+                .search
+                .current()
+                .is_some_and(|matched| matched.line == view.scroll)
+        {
+            view.jump_to_match(width);
+        }
+        self.screen_width = width;
     }
 
     pub fn items(&self) -> Vec<String> {
@@ -695,6 +906,7 @@ impl App {
             KeyCode::Char('~') => self.invoke(CommandId::Log),
             KeyCode::Enter => match self.workspace {
                 Workspace::History => {
+                    self.history_preferences = None;
                     if let Some(commit) = self.snapshot.commits.get(self.selected) {
                         self.detail(
                             ReadKind::Commit {
@@ -727,6 +939,7 @@ impl App {
         match modal {
             Modal::Loading(label) => {
                 if closing {
+                    self.history_preferences = None;
                     self.detail_read = None;
                     self.request_preview(false);
                 } else {
@@ -1036,12 +1249,18 @@ impl App {
                 self.modal = Some(Modal::Inline { conflict, editor });
             }
             Modal::Commit(mut view) => {
+                if view.history.search.editing.is_some() {
+                    view.edit_search(key, self.screen_width);
+                    self.modal = Some(Modal::Commit(view));
+                    return;
+                }
                 if closing {
                     self.commit_read = None;
                     self.request_preview(false);
                     return;
                 }
                 let mut reload = false;
+                let split = view.history.split(self.screen_width, view.full);
                 match key.code {
                     KeyCode::Tab | KeyCode::BackTab => {
                         view.focus = if view.focus == Focus::List {
@@ -1050,30 +1269,49 @@ impl App {
                             Focus::List
                         }
                     }
-                    KeyCode::Enter => view.focus = Focus::Preview,
+                    KeyCode::Enter if view.focus == Focus::List => {
+                        if !view.history.tree.toggle() {
+                            view.focus = Focus::Preview;
+                        }
+                    }
+                    KeyCode::Enter => {}
                     KeyCode::Down | KeyCode::Char('j') if view.focus == Focus::List => {
-                        view.selected =
-                            (view.selected + 1).min(view.commit.files.len().saturating_sub(1));
-                        reload = true;
+                        if let Some(index) = view.history.tree.navigate(1) {
+                            reload = view.select(index);
+                        }
                     }
                     KeyCode::Up | KeyCode::Char('k') if view.focus == Focus::List => {
-                        view.selected = view.selected.saturating_sub(1);
-                        reload = true;
+                        if let Some(index) = view.history.tree.navigate(-1) {
+                            reload = view.select(index);
+                        }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        view.scroll = view
-                            .scroll
-                            .saturating_add(1)
-                            .min(view.preview.lines().count().saturating_sub(1))
+                        view.scroll = view.history.document.step(view.scroll, 1, split);
                     }
-                    KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        view.scroll = view.history.document.step(view.scroll, -1, split)
+                    }
                     KeyCode::PageDown => {
-                        view.scroll = view
-                            .scroll
-                            .saturating_add(12)
-                            .min(view.preview.lines().count().saturating_sub(1))
+                        view.scroll = view.history.document.step(view.scroll, 12, split);
                     }
-                    KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(12),
+                    KeyCode::PageUp => {
+                        view.scroll = view.history.document.step(view.scroll, -12, split)
+                    }
+                    KeyCode::Right | KeyCode::Char('l') if view.focus == Focus::List => {
+                        if view
+                            .history
+                            .tree
+                            .selected()
+                            .is_some_and(|row| row.file.is_some())
+                        {
+                            view.focus = Focus::Preview;
+                        } else if let Some(index) = view.history.tree.expand() {
+                            reload = view.select(index);
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') if view.focus == Focus::List => {
+                        view.history.tree.collapse()
+                    }
                     KeyCode::Right | KeyCode::Char('l') => {
                         view.horizontal = view.horizontal.saturating_add(4)
                     }
@@ -1081,35 +1319,80 @@ impl App {
                         view.horizontal = view.horizontal.saturating_sub(4)
                     }
                     KeyCode::Home => {
-                        view.scroll = 0;
-                        view.horizontal = 0;
+                        if view.focus == Focus::List {
+                            if let Some(index) = view.history.tree.navigate(isize::MIN) {
+                                reload = view.select(index);
+                            }
+                        } else {
+                            view.scroll = 0;
+                            view.horizontal = 0;
+                        }
                     }
-                    KeyCode::End => view.scroll = view.preview.lines().count().saturating_sub(1),
+                    KeyCode::End if view.focus == Focus::List => {
+                        if let Some(index) = view.history.tree.navigate(isize::MAX) {
+                            reload = view.select(index);
+                        }
+                    }
+                    KeyCode::End => view.scroll = view.history.document.last(split),
+                    KeyCode::Char('[') | KeyCode::Char(']') => {
+                        if let Some(index) = view
+                            .history
+                            .tree
+                            .step_file(view.selected, key.code == KeyCode::Char('['))
+                        {
+                            reload = view.select(index);
+                        }
+                    }
                     KeyCode::Char('t') => {
+                        view.remember();
                         view.full = !view.full;
                         reload = true;
                     }
-                    KeyCode::Char('n') if !view.full => {
-                        if let Some(line) =
-                            view.preview.lines().enumerate().find(|(index, line)| {
-                                *index > view.scroll && line.starts_with("@@")
-                            })
+                    KeyCode::Char('d') => {
+                        view.history.layout = if view.history.layout == DiffLayout::Unified {
+                            DiffLayout::SideBySide
+                        } else {
+                            DiffLayout::Unified
+                        };
+                        if view
+                            .history
+                            .search
+                            .current()
+                            .is_some_and(|matched| matched.line == view.scroll)
                         {
-                            view.scroll = line.0;
+                            view.jump_to_match(self.screen_width);
                         }
                     }
-                    KeyCode::Char('p') if !view.full => {
+                    KeyCode::Char('/') => view.history.search.begin(),
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        view.history.search.next(key.code == KeyCode::Char('N'));
+                        view.jump_to_match(self.screen_width);
+                    }
+                    KeyCode::Char('}') if !view.full => {
                         if let Some(line) = view
-                            .preview
-                            .lines()
-                            .enumerate()
-                            .filter(|(index, line)| *index < view.scroll && line.starts_with("@@"))
-                            .last()
+                            .history
+                            .document
+                            .hunks
+                            .iter()
+                            .find(|index| **index > view.scroll)
                         {
-                            view.scroll = line.0;
+                            view.scroll = *line;
+                        }
+                    }
+                    KeyCode::Char('{') if !view.full => {
+                        if let Some(line) = view
+                            .history
+                            .document
+                            .hunks
+                            .iter()
+                            .rev()
+                            .find(|index| **index < view.scroll)
+                        {
+                            view.scroll = *line;
                         }
                     }
                     KeyCode::Char('P') if view.commit.parents.len() > 1 => {
+                        self.history_preferences = Some(view.preferences());
                         self.commit_read = None;
                         self.detail(
                             ReadKind::Commit {
@@ -2072,6 +2355,7 @@ impl App {
     }
 
     fn cancel_reads(&mut self) {
+        self.history_preferences = None;
         self.loader.clear();
         self.snapshot_read = None;
         self.preview_read = None;
@@ -2101,9 +2385,7 @@ impl App {
 
     fn load_commit_preview(&mut self) {
         if let Some(Modal::Commit(view)) = &mut self.modal {
-            view.preview = "Loading file…".into();
-            view.scroll = 0;
-            view.horizontal = 0;
+            view.start_loading();
             let kind = ReadKind::CommitPreview {
                 commit: view.commit.clone(),
                 index: view.selected,
@@ -2170,11 +2452,15 @@ impl App {
             } else if self.commit_read == Some(response.id) {
                 self.commit_read = None;
                 if let Some(Modal::Commit(view)) = &mut self.modal {
-                    view.preview = match response.result {
-                        Ok(ReadData::CommitPreview(text)) => text,
-                        Err(error) => format!("Could not load file:\n{error}"),
-                        _ => String::new(),
+                    let preview = match response.result {
+                        Ok(ReadData::CommitPreview(preview)) => *preview,
+                        Err(error) => HistoricalPreview::new(
+                            format!("Could not load file:\n{error}"),
+                            view.full,
+                        ),
+                        _ => HistoricalPreview::new(String::new(), view.full),
                     };
+                    view.loaded(preview, self.screen_width);
                     changed = true;
                 }
             } else if self.detail_read == Some(response.id) {
@@ -2194,18 +2480,14 @@ impl App {
                     }
                     Ok(ReadData::Output { title, text }) => self.output(&title, text),
                     Ok(ReadData::Commit(commit)) => {
-                        self.modal = Some(Modal::Commit(Box::new(CommitView {
+                        self.modal = Some(Modal::Commit(Box::new(CommitView::new(
                             commit,
-                            selected: 0,
-                            focus: Focus::List,
-                            full: false,
-                            preview: String::new(),
-                            scroll: 0,
-                            horizontal: 0,
-                        })));
+                            self.history_preferences.take(),
+                        ))));
                         self.load_commit_preview();
                     }
                     Err(error) => {
+                        self.history_preferences = None;
                         self.last_output = error.clone();
                         self.error = Some(error);
                     }
@@ -2227,6 +2509,7 @@ impl App {
 
     pub fn handle_paste(&mut self, text: &str) {
         match &mut self.modal {
+            Some(Modal::Commit(view)) => view.history.search.paste(text),
             Some(Modal::Inline { editor, .. }) => {
                 if let Err(error) = editor.paste(text) {
                     self.fail(error);

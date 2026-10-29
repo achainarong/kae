@@ -3,6 +3,7 @@ mod conflict;
 mod editor;
 mod git;
 mod graph;
+mod history;
 mod loader;
 mod rebase;
 mod ui;

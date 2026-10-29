@@ -800,11 +800,20 @@ impl Repo {
             ])
         };
         args.push("--".into());
-        args.push(file.path.as_os_str().to_owned());
+        args.push(exact_file_pathspec(&file.path)?);
         if let Some(original) = &file.original {
-            args.push(original.as_os_str().to_owned());
+            args.push(exact_file_pathspec(original)?);
         }
-        let output = self.checked(&args, None)?;
+        // Explicit, escaped pathspecs must not inherit literal-pathspec mode.
+        // An ordinary literal path also selects descendants when a file was
+        // replaced by a directory, leaking unrelated patches into this view.
+        let output = self.run_command(self.command().args(&args), None)?;
+        ensure!(output.success, "{}", output.text().trim());
+        ensure!(
+            !output.truncated,
+            "Git diff exceeded the safety limit; use Git directly for this file."
+        );
+        let output = output.stdout;
         Ok(if output.is_empty() {
             "No textual changes for this file.".into()
         } else {
@@ -844,6 +853,23 @@ impl Repo {
         }
         Ok(path)
     }
+}
+
+fn exact_file_pathspec(path: &Path) -> Result<OsString> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let (first, rest) = bytes.split_first().context("Empty historical file path")?;
+    // A quoted one-byte character class forces Git's whole-path glob matcher;
+    // without a wildcard Git treats even a :(literal) path as a directory prefix.
+    let mut pattern = b":(top,glob)[\\".to_vec();
+    pattern.push(*first);
+    pattern.push(b']');
+    for byte in rest {
+        if matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\') {
+            pattern.push(b'\\');
+        }
+        pattern.push(*byte);
+    }
+    os_bytes(&pattern)
 }
 
 pub fn strings(args: &[&str]) -> Vec<OsString> {
