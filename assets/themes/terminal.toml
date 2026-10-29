@@ -1,0 +1,2 @@
+# Inherit the terminal's ANSI palette and background.
+base = "terminal"

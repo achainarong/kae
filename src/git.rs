@@ -216,6 +216,16 @@ impl Action {
         self.idle = true;
         self
     }
+
+    pub fn updates_only_index(&self) -> bool {
+        self.args.first().is_some_and(|command| {
+            command == "add"
+                || (command == "restore"
+                    && self.args.iter().any(|arg| arg == "--staged")
+                    && !self.args.iter().any(|arg| arg == "--worktree"))
+                || (command == "rm" && self.args.iter().any(|arg| arg == "--cached"))
+        })
+    }
 }
 
 impl Repo {
@@ -363,6 +373,9 @@ impl Repo {
     }
 
     pub fn operation(&self) -> Result<Option<Operation>> {
+        // All operation markers are worktree-local. Resolve that directory once,
+        // including for linked worktrees, rather than spawning Git per marker.
+        let git_dir = self.git_path("")?;
         for (marker, operation) in [
             ("rebase-merge", Operation::Rebase),
             ("rebase-apply/rebasing", Operation::Rebase),
@@ -371,11 +384,11 @@ impl Repo {
             ("CHERRY_PICK_HEAD", Operation::CherryPick),
             ("REVERT_HEAD", Operation::Revert),
         ] {
-            if self.git_path(marker)?.exists() {
+            if git_dir.join(marker).exists() {
                 return Ok(Some(operation));
             }
         }
-        if let Ok(todo) = fs::read_to_string(self.git_path("sequencer/todo")?) {
+        if let Ok(todo) = fs::read_to_string(git_dir.join("sequencer/todo")) {
             if todo.lines().any(|line| line.starts_with("revert ")) {
                 return Ok(Some(Operation::Revert));
             }
@@ -566,6 +579,30 @@ impl Repo {
 
     pub fn snapshot(&self) -> Result<Snapshot> {
         let guard = self.guard()?;
+        self.snapshot_with_guard(guard)
+    }
+
+    /// Index updates cannot change history. Reuse it only after a fresh, full
+    /// guard confirms that refs, HEAD, operation, and upstream config still match.
+    /// External changes fall back to the normal complete snapshot.
+    pub fn refresh_index(&self, previous: &Snapshot) -> Result<Snapshot> {
+        let guard = self.guard()?;
+        let old = &previous.guard;
+        if guard.head != old.head
+            || guard.symbolic_head != old.symbolic_head
+            || guard.operation != old.operation
+            || guard.refs != old.refs
+            || guard.remote_config != old.remote_config
+        {
+            return self.snapshot_with_guard(guard);
+        }
+        let mut snapshot = previous.clone();
+        snapshot.files = parse_status(&guard.status)?;
+        snapshot.guard = guard;
+        Ok(snapshot)
+    }
+
+    fn snapshot_with_guard(&self, guard: Guard) -> Result<Snapshot> {
         let files = parse_status(&guard.status)?;
         let branch = self
             .text(&["symbolic-ref", "--quiet", "--short", "HEAD"])

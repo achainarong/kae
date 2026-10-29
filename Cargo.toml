@@ -18,6 +18,8 @@ shell-words = "1"
 similar = "2"
 signal-hook = "0.3"
 tempfile = "3"
+toml = "0.8"
+toml_edit = "0.22"
 
 [profile.release]
 lto = "thin"

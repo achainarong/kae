@@ -32,20 +32,33 @@ impl ResultEditor {
         );
         let eol = if crlf > 0 { "\r\n" } else { "\n" };
         let lines = text.split(eol).map(str::to_owned).collect();
-        let mut area = ratatui_textarea::TextArea::new(lines);
-        area.set_block(
-            ratatui::widgets::Block::bordered()
-                .title(" Result editor · Ctrl-S review save · Esc keep draft "),
-        );
-        area.set_cursor_line_style(ratatui::style::Style::default());
-        area.set_line_number_style(
-            ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
-        );
-        Ok(Self { area, eol })
+        let area = ratatui_textarea::TextArea::new(lines);
+        let mut editor = Self { area, eol };
+        editor.set_theme(&crate::theme::Theme::default());
+        Ok(editor)
     }
 
     pub fn text(&self) -> String {
         self.area.lines().join(self.eol)
+    }
+
+    pub fn set_theme(&mut self, theme: &crate::theme::Theme) {
+        use ratatui::{style::Style, widgets::Block};
+        self.area
+            .set_style(Style::default().fg(theme.text).bg(theme.background));
+        self.area.set_block(
+            Block::bordered()
+                .title(" Result editor · Ctrl-S review save · Esc keep draft ")
+                .border_style(Style::default().fg(theme.accent)),
+        );
+        self.area
+            .set_cursor_line_style(Style::default().bg(theme.selection));
+        self.area
+            .set_line_number_style(Style::default().fg(theme.muted));
+        self.area
+            .set_selection_style(Style::default().bg(theme.selection).fg(theme.text));
+        self.area
+            .set_cursor_style(Style::default().bg(theme.accent).fg(theme.search_text));
     }
 
     pub fn paste(&mut self, text: &str) -> Result<()> {

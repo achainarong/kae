@@ -44,6 +44,38 @@ pub struct FileTree {
 
 impl FileTree {
     pub fn new(files: &[CommittedFile]) -> Self {
+        Self::build(files, false)
+    }
+
+    pub fn compact(files: &[CommittedFile]) -> Self {
+        Self::build(files, true)
+    }
+
+    /// Add a presentation-only repository root. Empty paths identify the root;
+    /// Git actions still receive only the actual changed-file paths.
+    pub fn with_root(mut self, name: OsString) -> Self {
+        for row in &mut self.all {
+            row.depth += 1;
+        }
+        self.all.insert(
+            0,
+            TreeRow {
+                path: PathBuf::new(),
+                name,
+                depth: 0,
+                file: None,
+                count: self.order.len(),
+            },
+        );
+        let selected = self
+            .rows
+            .get(self.cursor)
+            .map(|row| (row.path.clone(), row.file.is_none()));
+        self.rebuild(selected);
+        self
+    }
+
+    fn build(files: &[CommittedFile], compact: bool) -> Self {
         let mut root = Directory::default();
         for (index, file) in files.iter().enumerate() {
             let mut components = file.path.iter().peekable();
@@ -65,10 +97,18 @@ impl FileTree {
             parent: &Path,
             depth: usize,
             rows: &mut Vec<TreeRow>,
+            compact: bool,
         ) -> usize {
             let mut count = directory.files.len();
-            for (name, child) in directory.directories {
-                let path = parent.join(&name);
+            for (mut name, mut child) in directory.directories {
+                let mut path = parent.join(&name);
+                while compact && child.files.is_empty() && child.directories.len() == 1 {
+                    let (next, nested) = child.directories.into_iter().next().expect("one child");
+                    path.push(&next);
+                    name.push("/");
+                    name.push(next);
+                    child = nested;
+                }
                 let row = rows.len();
                 rows.push(TreeRow {
                     path: path.clone(),
@@ -77,7 +117,7 @@ impl FileTree {
                     file: None,
                     count: 0,
                 });
-                let children = flatten(child, &path, depth + 1, rows);
+                let children = flatten(child, &path, depth + 1, rows, compact);
                 rows[row].count = children;
                 count += children;
             }
@@ -92,7 +132,7 @@ impl FileTree {
             }
             count
         }
-        flatten(root, Path::new(""), 0, &mut all);
+        flatten(root, Path::new(""), 0, &mut all, compact);
         let order = all.iter().filter_map(|row| row.file).collect();
         let mut tree = Self {
             rows: all.clone(),
@@ -181,11 +221,15 @@ impl FileTree {
             self.rebuild(Some((path, true)));
             return;
         }
-        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty())
-            && let Some(index) = self
-                .rows
-                .iter()
-                .position(|row| row.file.is_none() && row.path == parent)
+        if let Some(index) = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.file.is_none() && row.path != path && path.starts_with(&row.path)
+            })
+            .max_by_key(|(_, row)| row.depth)
+            .map(|(index, _)| index)
         {
             self.cursor = index;
         }

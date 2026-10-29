@@ -1,0 +1,4 @@
+# Kae appearance. Theme files live in themes/ beside this file.
+theme = "catppuccin-mocha"
+# Inherit your terminal background and opacity. Set false for a solid theme background.
+transparent = true

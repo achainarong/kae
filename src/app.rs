@@ -15,13 +15,15 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::DefaultTerminal;
 
 use crate::{
+    config::{self, Config},
     conflict::{Choice, Conflict},
     editor,
     git::{Action, CommitFiles, GitOutput, Hunks, Repo, Snapshot},
     history::{DiffLayout, HistoricalPreview, History, Position, Preferences},
     loader::{Loader, Preview, ReadData, ReadKind, Request},
     rebase::{Plan, RebaseAction},
-    ui,
+    theme::Theme,
+    tree, ui,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +117,7 @@ pub enum CommandId {
     Abort,
     Review,
     Log,
+    Theme,
 }
 
 impl CommandId {
@@ -131,7 +134,7 @@ impl CommandId {
             // replacement have their own contextual confirmation steps.
             Stage | StageAll | Hunks | Commit | Edit | Resolve | BranchCreate | BranchSwitch
             | Compare | MergePreview | Rebase | TagCreate | WorktreeAdd | WorktreeOpen | Review
-            | Log => false,
+            | Log | Theme => false,
         }
     }
     pub const ALL: [Self; 42] = [
@@ -181,8 +184,9 @@ impl CommandId {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Stage => "Stage selected file",
-            Self::Unstage => "Unstage selected file",
+            Self::Theme => "Change theme",
+            Self::Stage => "Stage selected file / folder",
+            Self::Unstage => "Unstage selected file / folder",
             Self::StageAll => "Stage all files",
             Self::UnstageAll => "Unstage all files",
             Self::Hunks => "Stage / unstage individual hunks",
@@ -230,11 +234,11 @@ impl CommandId {
     pub fn available(self, app: &App) -> bool {
         use CommandId::*;
         match self {
-            Stage | Unstage | Hunks | Discard | Edit => {
-                app.workspace == Workspace::Files && !app.snapshot.files.is_empty()
-            }
+            Stage | Unstage => app.workspace == Workspace::Files && !app.snapshot.files.is_empty(),
+            Hunks | Discard | Edit => app.workspace == Workspace::Files && app.file_selected(),
             Resolve | TakeCurrent | TakeIncoming | DeleteConflict => {
                 app.workspace == Workspace::Files
+                    && app.file_selected()
                     && app
                         .snapshot
                         .files
@@ -480,6 +484,11 @@ pub enum PromptKind {
 }
 
 pub enum Modal {
+    Theme {
+        names: Vec<String>,
+        selected: usize,
+        original: Theme,
+    },
     Loading(String),
     Help {
         scroll: u16,
@@ -540,6 +549,10 @@ pub struct App {
     pub preview_loading: bool,
     pub confirm_scroll: u16,
     pub screen_width: u16,
+    pub theme: Theme,
+    pub config: Config,
+    pub config_root: Option<PathBuf>,
+    pub explorer: crate::history::FileTree,
     history_preferences: Option<Preferences>,
     loader: Loader,
     next_read: u64,
@@ -560,6 +573,24 @@ impl App {
             root: std::env::current_dir()?.join(path),
         };
         let snapshot = Snapshot::loading();
+        let explorer = tree::explorer(&[], &repo.root);
+        let config_root = config::directory();
+        let loaded_config = config_root.as_deref().map(Config::load).transpose();
+        let (config, mut config_error) = match loaded_config {
+            Ok(config) => (config.unwrap_or_default(), None),
+            Err(error) => (Config::default(), Some(error.to_string())),
+        };
+        let theme = match config_root
+            .as_deref()
+            .map(|root| config.resolve(root, &config.theme))
+            .transpose()
+        {
+            Ok(theme) => theme.unwrap_or_default(),
+            Err(error) => {
+                config_error = Some(error.to_string());
+                Theme::default()
+            }
+        };
         let mut app = Self {
             repo,
             snapshot,
@@ -571,7 +602,7 @@ impl App {
             horizontal: 0,
             modal: None,
             notice: "Ready · : command search · ? help".into(),
-            error: None,
+            error: config_error,
             busy: None,
             quit_requested: false,
             last_output: "No operations yet.".into(),
@@ -579,6 +610,10 @@ impl App {
             preview_loading: false,
             confirm_scroll: 0,
             screen_width: 120,
+            theme,
+            config,
+            config_root,
+            explorer,
             history_preferences: None,
             loader: Loader::new(),
             next_read: 0,
@@ -688,13 +723,11 @@ impl App {
                     Event::Resize(width, _) => {
                         self.update_width(width);
                     }
-                    Event::Mouse(mouse) if self.modal.is_none() && self.busy.is_none() => {
-                        match mouse.kind {
-                            event::MouseEventKind::ScrollDown => self.navigate(3),
-                            event::MouseEventKind::ScrollUp => self.navigate(-3),
-                            _ => {}
-                        }
-                    }
+                    Event::Mouse(mouse) if self.modal.is_none() => match mouse.kind {
+                        event::MouseEventKind::ScrollDown => self.navigate(3),
+                        event::MouseEventKind::ScrollUp => self.navigate(-3),
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -789,6 +822,7 @@ impl App {
         CommandId::ALL
             .into_iter()
             .chain([CommandId::Log])
+            .chain([CommandId::Theme])
             .filter(|command| {
                 command.available(self)
                     && command
@@ -820,13 +854,33 @@ impl App {
             return;
         }
         if self.busy.is_some() {
-            if key.code == KeyCode::Char('?') {
-                self.modal = Some(Modal::Help { scroll: 0 });
-            }
             if key.code == KeyCode::Char('q') {
                 self.quit_requested = true;
+                return;
             }
-            return;
+            // The mutation worker owns writes, not the UI. Keep read-only
+            // navigation live; do not queue mutations against an old snapshot.
+            if !matches!(
+                key.code,
+                KeyCode::Char('?')
+                    | KeyCode::Char('1'..='7')
+                    | KeyCode::Char('[' | ']' | 'j' | 'k' | 'h' | 'l')
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Esc
+            ) {
+                self.notice =
+                    "Git is running; navigation is available, further mutations are locked.".into();
+                return;
+            }
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
@@ -853,6 +907,24 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.navigate(1),
             KeyCode::Up | KeyCode::Char('k') => self.navigate(-1),
+            KeyCode::Char('h') | KeyCode::Left
+                if self.workspace == Workspace::Files && self.focus == Focus::List =>
+            {
+                self.explorer.collapse();
+                self.load_preview();
+            }
+            KeyCode::Char('l') | KeyCode::Right
+                if self.workspace == Workspace::Files && self.focus == Focus::List =>
+            {
+                if self.file_selected() {
+                    self.focus = Focus::Preview;
+                } else {
+                    if let Some(index) = self.explorer.expand() {
+                        self.selected = index;
+                    }
+                    self.load_preview();
+                }
+            }
             KeyCode::Char('h') | KeyCode::Left => {
                 self.horizontal = self.horizontal.saturating_sub(4)
             }
@@ -873,11 +945,22 @@ impl App {
                 self.scroll = 0;
                 self.horizontal = 0;
                 if self.focus == Focus::List {
-                    self.selected = 0;
+                    if self.workspace == Workspace::Files {
+                        if let Some(index) = self.explorer.navigate(isize::MIN) {
+                            self.selected = index;
+                        }
+                    } else {
+                        self.selected = 0;
+                    }
                     self.load_preview();
                 }
             }
             KeyCode::Esc => self.error = None,
+            KeyCode::Char(' ')
+                if self.workspace == Workspace::Files && self.focus == Focus::List =>
+            {
+                self.toggle_staging();
+            }
             KeyCode::Char('s') if self.workspace == Workspace::Files => {
                 self.invoke(CommandId::Stage)
             }
@@ -905,6 +988,10 @@ impl App {
             KeyCode::Char('A') => self.invoke(CommandId::Abort),
             KeyCode::Char('~') => self.invoke(CommandId::Log),
             KeyCode::Enter => match self.workspace {
+                Workspace::Files if self.focus == Focus::List && !self.file_selected() => {
+                    self.explorer.toggle();
+                    self.load_preview();
+                }
                 Workspace::History => {
                     self.history_preferences = None;
                     if let Some(commit) = self.snapshot.commits.get(self.selected) {
@@ -937,6 +1024,59 @@ impl App {
     fn handle_modal(&mut self, modal: Modal, key: KeyEvent) {
         let closing = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
         match modal {
+            Modal::Theme {
+                names,
+                mut selected,
+                original,
+            } => {
+                if closing {
+                    self.theme = original;
+                    return;
+                }
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        selected = (selected + 1).min(names.len().saturating_sub(1))
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                    KeyCode::Enter => {
+                        if let (Some(root), Some(name)) = (&self.config_root, names.get(selected)) {
+                            let result = self.config.resolve(root, name).and_then(|theme| {
+                                Config::save_theme(root, name)?;
+                                Ok(theme)
+                            });
+                            match result {
+                                Ok(theme) => {
+                                    self.theme = theme;
+                                    self.config.theme = name.clone();
+                                    self.notice = format!("Theme: {name}");
+                                    return;
+                                }
+                                Err(error) => self.fail(error),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if let (Some(root), Some(name)) = (&self.config_root, names.get(selected)) {
+                    match self.config.resolve(root, name) {
+                        Ok(theme) => {
+                            self.theme = theme;
+                            if key.code != KeyCode::Enter {
+                                self.error = None;
+                            }
+                        }
+                        Err(error) => {
+                            self.theme = original.clone();
+                            self.fail(error);
+                        }
+                    }
+                }
+                self.modal = Some(Modal::Theme {
+                    names,
+                    selected,
+                    original,
+                });
+            }
             Modal::Loading(label) => {
                 if closing {
                     self.history_preferences = None;
@@ -1187,7 +1327,8 @@ impl App {
                         }
                         KeyCode::Char('e') => {
                             match editor::ResultEditor::new(&conflict.result()) {
-                                Ok(editor) => {
+                                Ok(mut editor) => {
+                                    editor.set_theme(&self.theme);
                                     self.modal = Some(Modal::Inline {
                                         conflict,
                                         editor: Box::new(editor),
@@ -1529,6 +1670,9 @@ impl App {
     fn switch(&mut self, workspace: Workspace) {
         self.workspace = workspace;
         self.selected = 0;
+        if workspace == Workspace::Files {
+            self.explorer.select_file(0);
+        }
         self.focus = Focus::List;
         self.load_preview();
     }
@@ -1543,6 +1687,13 @@ impl App {
                     .min(u16::MAX as usize) as u16,
             );
         } else {
+            if self.workspace == Workspace::Files {
+                if let Some(index) = self.explorer.navigate(delta) {
+                    self.selected = index;
+                }
+                self.load_preview();
+                return;
+            }
             self.selected = self
                 .selected
                 .saturating_add_signed(delta)
@@ -1555,7 +1706,128 @@ impl App {
         self.request_preview(true);
     }
 
+    pub fn file_selected(&self) -> bool {
+        self.explorer
+            .selected()
+            .is_some_and(|row| row.file == Some(self.selected))
+            && self.snapshot.files.get(self.selected).is_some()
+    }
+
+    fn toggle_staging(&mut self) {
+        let Some(row) = self.explorer.selected() else {
+            return;
+        };
+        let files: Vec<_> = if let Some(index) = row.file {
+            self.snapshot.files.get(index).into_iter().collect()
+        } else {
+            self.snapshot
+                .files
+                .iter()
+                .filter(|file| file.path.starts_with(&row.path))
+                .collect()
+        };
+        if files.iter().any(|file| file.status.as_bytes()[1] != b' ') {
+            self.invoke(CommandId::Stage);
+        } else if files
+            .iter()
+            .any(|file| !matches!(file.status.as_bytes()[0], b' ' | b'?'))
+        {
+            self.invoke(CommandId::Unstage);
+        } else {
+            self.notice = "No changes to stage or unstage in this selection.".into();
+        }
+    }
+
+    fn prepare_folder(&mut self, command: CommandId) -> Result<()> {
+        let row = self.explorer.selected().context("Select a folder")?;
+        ensure!(row.file.is_none(), "Select a folder");
+        let files = self
+            .snapshot
+            .files
+            .iter()
+            .filter(|file| file.path.starts_with(&row.path))
+            .collect::<Vec<_>>();
+        ensure!(!files.is_empty(), "No changed files in this folder");
+        // Never silently mark unresolved conflicts as resolved in a bulk action.
+        ensure!(
+            command != CommandId::Stage || !files.iter().any(|file| file.is_conflict()),
+            "Resolve and stage conflicted files individually before staging this folder"
+        );
+        let args: &[&str] = if command == CommandId::Stage {
+            &["add", "--all"]
+        } else if self.snapshot.head.is_some() {
+            &["restore", "--staged"]
+        } else {
+            &["rm", "--cached", "-f"]
+        };
+        let mut action = Action::new(&self.snapshot, command.label(), args);
+        action.args.push("--".into());
+        let mut paths = std::collections::BTreeSet::new();
+        for file in &files {
+            // Untracked files have no index entry to restore/remove.
+            if command == CommandId::Unstage && file.status == "??" {
+                continue;
+            }
+            paths.insert(file.path.clone());
+            if let Some(original) = &file.original
+                && (command == CommandId::Unstage
+                    || !matches!(file.status.as_bytes()[0], b'R' | b'C'))
+            {
+                paths.insert(original.clone());
+            }
+        }
+        ensure!(!paths.is_empty(), "No staged files in this folder");
+        let detail = format!(
+            "{} folder {:?}?\n{} changed files; {} paths (including rename sources):\n{}\n\nWorking files are not deleted. Staging can replace previous staged-only content; unstaging can discard staged-only content.\nRename sources outside this folder are included explicitly.",
+            if command == CommandId::Stage {
+                "Stage"
+            } else {
+                "Unstage"
+            },
+            if row.path.as_os_str().is_empty() {
+                &self.repo.root
+            } else {
+                &row.path
+            },
+            files.len(),
+            paths.len(),
+            paths
+                .iter()
+                .map(|path| format!("  {:?}", path))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        action
+            .args
+            .extend(paths.into_iter().map(|path| path.into_os_string()));
+        self.modal = Some(Modal::Confirm {
+            task: Task::Git(action),
+            detail,
+        });
+        Ok(())
+    }
+
     fn preview_target(&self) -> Preview {
+        if self.workspace == Workspace::Files
+            && !self.file_selected()
+            && let Some(row) = self.explorer.selected()
+        {
+            if self.snapshot.files.is_empty() {
+                return Preview::Empty(
+                    "Working tree is clean.\n\nPress 2 for history or : for commands.".into(),
+                );
+            }
+            return Preview::Empty(format!(
+                "{}\n\n{} changed files\n\nEnter expand / collapse\ns stage changed files\nu review unstaging\n\nSelect a file to see its diff.",
+                if row.path.as_os_str().is_empty() {
+                    &self.repo.root
+                } else {
+                    &row.path
+                }
+                .display(),
+                row.count
+            ));
+        }
         let empty = || Preview::Empty("Nothing here yet. Use : for commands.".into());
         match self.workspace {
             Workspace::Files => self
@@ -1677,7 +1949,7 @@ impl App {
     }
 
     fn request_preview(&mut self, reset: bool) {
-        if !self.loaded || self.busy.is_some() {
+        if !self.loaded {
             return;
         }
         if reset {
@@ -1741,6 +2013,10 @@ impl App {
     }
 
     fn invoke(&mut self, command: CommandId) {
+        if self.busy.is_some() {
+            self.notice = "Wait for the current Git operation before making another change.".into();
+            return;
+        }
         self.error = None;
         if !self.loaded {
             self.error = Some("Wait for repository loading to finish.".into());
@@ -1765,10 +2041,40 @@ impl App {
 
     fn prepare(&mut self, command: CommandId, input: Option<String>) -> Result<()> {
         use CommandId::*;
+        if command == Theme {
+            let root = self
+                .config_root
+                .as_ref()
+                .context("Set HOME or XDG_CONFIG_HOME to use theme configuration")?;
+            let names = Config::themes(root);
+            let selected = names
+                .iter()
+                .position(|name| *name == self.config.theme)
+                .unwrap_or(0);
+            self.modal = Some(Modal::Theme {
+                names,
+                selected,
+                original: self.theme.clone(),
+            });
+            return Ok(());
+        }
+        if matches!(command, Stage | Unstage) && !self.file_selected() {
+            return self.prepare_folder(command);
+        }
+        if matches!(
+            command,
+            Hunks | Discard | Edit | Resolve | TakeCurrent | TakeIncoming | DeleteConflict
+        ) {
+            ensure!(
+                self.file_selected(),
+                "Select a file, not a folder, for this action"
+            );
+        }
         let new = |args: &[&str]| Action::new(&self.snapshot, command.label(), args);
         let mut confirm = false;
         let mut detail = command.label().to_owned();
         let action = match command {
+            Theme => unreachable!(),
             Log => {
                 self.output("Last Git operation", self.last_output.clone());
                 return Ok(());
@@ -2193,6 +2499,8 @@ impl App {
         }
         self.cancel_reads();
         let repo = self.repo.clone();
+        let index_snapshot = matches!(&task, Task::Git(action) if action.updates_only_index())
+            .then(|| self.snapshot.clone());
         let label = match &task {
             Task::Git(action) | Task::Preview(action) => action.label.clone(),
             Task::Hunk(_) => "Apply selected hunk".into(),
@@ -2224,7 +2532,11 @@ impl App {
                 }
             }
             .map_err(|error| format!("{error:#}"));
-            let snapshot = repo.snapshot().map_err(|error| format!("{error:#}"));
+            let snapshot = match index_snapshot {
+                Some(previous) => repo.refresh_index(&previous),
+                None => repo.snapshot(),
+            }
+            .map_err(|error| format!("{error:#}"));
             let _ = sender.send(WorkerResult {
                 label,
                 output,
@@ -2368,6 +2680,14 @@ impl App {
     fn apply_snapshot(&mut self, repo: Repo, snapshot: Snapshot) {
         let key = self.selected_key();
         let index = self.selected;
+        let cursor = (self.loaded && !self.snapshot.files.is_empty())
+            .then(|| {
+                self.explorer
+                    .selected()
+                    .map(|row| (row.path.clone(), row.file.is_none()))
+            })
+            .flatten();
+        let collapsed = self.explorer.collapsed.clone();
         self.repo = repo;
         self.snapshot = snapshot;
         self.loaded = true;
@@ -2379,6 +2699,26 @@ impl App {
             })
         });
         self.selected = retained.unwrap_or_else(|| index.min(count.saturating_sub(1)));
+        self.explorer = tree::explorer(&self.snapshot.files, &self.repo.root);
+        if self.workspace == Workspace::Files {
+            let cursor = if cursor.as_ref().is_some_and(|(_, directory)| *directory) {
+                cursor
+            } else {
+                self.snapshot
+                    .files
+                    .get(self.selected)
+                    .map(|file| (file.path.clone(), false))
+            };
+            self.explorer
+                .restore_collapsed(collapsed, self.selected, cursor);
+        } else {
+            self.explorer.restore_collapsed(collapsed, 0, cursor);
+        }
+        if self.workspace == Workspace::Files
+            && let Some(index) = self.explorer.selected().and_then(|row| row.file)
+        {
+            self.selected = index;
+        }
         self.last_refresh = Instant::now();
         self.request_preview(retained.is_none());
     }
@@ -2574,6 +2914,67 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         assert!(matches!(app.modal, Some(Modal::Help { .. })));
         release.send(()).unwrap();
+    }
+
+    #[test]
+    fn navigation_stays_live_during_a_delayed_mutation_but_writes_are_not_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo {
+            root: dir.path().into(),
+        };
+        repo.bytes(&["init", "-b", "main"]).unwrap();
+        std::fs::write(dir.path().join("a"), "alpha").unwrap();
+        std::fs::write(dir.path().join("b"), "beta").unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        app.cancel_reads();
+        app.worker = Some(receiver);
+        app.busy = Some("Delayed stage".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.snapshot.files[app.selected].path, Path::new("b"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.preview_loading && Instant::now() < deadline {
+            app.poll_loading();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.preview.contains("beta"));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.horizontal, 4);
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.workspace, Workspace::History);
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        for code in [
+            KeyCode::Char(' '),
+            KeyCode::Char('s'),
+            KeyCode::Char('u'),
+            KeyCode::Char('c'),
+            KeyCode::Enter,
+        ] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(app.modal.is_none());
+            assert_eq!(app.busy.as_deref(), Some("Delayed stage"));
+        }
+        assert!(repo.bytes(&["ls-files"]).unwrap().is_empty());
+        // Complete the simulated worker. The final snapshot must retain the
+        // selection made during the wait, not jump to the original action target.
+        let output = repo
+            .run(&crate::git::strings(&["add", "--", "a"]), None)
+            .unwrap();
+        sender
+            .send(WorkerResult {
+                label: "Stage a".into(),
+                output: Ok(output),
+                snapshot: Ok(repo.snapshot().unwrap()),
+                preview: false,
+                conflict: None,
+            })
+            .unwrap();
+        assert!(app.poll_worker());
+        assert!(app.busy.is_none());
+        assert_eq!(app.snapshot.files[app.selected].path, Path::new("b"));
+        assert_eq!(repo.text(&["ls-files"]).unwrap(), "a");
     }
 
     #[test]

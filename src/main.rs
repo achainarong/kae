@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod conflict;
 mod editor;
 mod git;
@@ -6,6 +7,8 @@ mod graph;
 mod history;
 mod loader;
 mod rebase;
+mod theme;
+mod tree;
 mod ui;
 
 use std::{io::IsTerminal, path::PathBuf};
@@ -44,6 +47,11 @@ fn main() -> Result<()> {
 
     // Repository discovery and reads happen in the loader after the first frame.
     let mut app = App::new(&cli.path)?;
+    if let Some(root) = &app.config_root
+        && let Err(error) = config::Config::initialize(root)
+    {
+        app.error = Some(format!("Could not initialize theme files: {error}"));
+    }
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
     // ratatui also installs a panic hook that restores the terminal.

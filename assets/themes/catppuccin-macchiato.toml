@@ -1,0 +1,2 @@
+# Override any semantic color with #RRGGBB, e.g. accent = "#b7bdf8".
+base = "catppuccin-macchiato"

@@ -1,0 +1,2 @@
+# Light theme. Override any semantic color with #RRGGBB.
+base = "catppuccin-latte"

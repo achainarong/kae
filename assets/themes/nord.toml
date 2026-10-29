@@ -1,0 +1,2 @@
+# Cool, muted dark theme. Override any semantic color with #RRGGBB.
+base = "nord"

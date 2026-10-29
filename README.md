@@ -54,7 +54,7 @@ Launch `kae` inside a repository or use `-C` / `--path`. Subdirectories and link
 
 | Key | Workspace | Features |
 | --- | --- | --- |
-| `1` | Files | Status, staged/unstaged diffs, text previews, file/hunk staging, commit, amend, external editor, confirmed discard |
+| `1` | Files | Expandable folder tree, staged/unstaged diffs, file/folder/hunk staging, commit, amend, external editor, confirmed discard |
 | `2` | History | Commit graph, expandable file tree, searchable unified/split diffs and full contents, compare, cherry-pick, revert, interactive rebase |
 | `3` | Branches | Create, switch, rename, safe deletion, compare, merge preview, merge |
 | `4` | Remotes | Fetch, explicit pull strategy, non-forced push, upstream setup, ahead/behind status |
@@ -73,7 +73,8 @@ Press **`:`** or **`/`** for searchable, context-aware commands. Some operations
 | `Tab` | Switch list/preview focus |
 | `h` / `l`, left/right | Scroll horizontally |
 | `PageUp` / `PageDown`, `Home` | Scroll preview, return to the top |
-| `s` / `u`, `S` / `U` | Stage/unstage selected file, or all files |
+| `s` / `u`, `S` / `U` | Stage/unstage selected file or folder, or all files |
+| `Space` in the Files tree | Stage remaining unstaged changes; otherwise review unstaging |
 | `v` | Open hunk staging for the selected file |
 | `c` / `a` | Commit staged changes / amend HEAD |
 | `e` | Open selected file in `$VISUAL`, `$EDITOR`, or `vi` |
@@ -90,6 +91,64 @@ Press **`:`** or **`/`** for searchable, context-aware commands. Some operations
 In prompts: type, Backspace, **Ctrl-U** to clear, Enter to accept, Esc to cancel. In confirmations, only **typed `y`** proceeds; `n` or Esc cancels. Pasted text never confirms or executes actions. A `q` typed into a prompt or inline editor is input, not quit.
 
 Wide terminals use side-by-side panes; narrower terminals stack them. Main navigation needs 44 × 12; conflict, hunk, rebase, and confirmation screens need 60 × 24. Editing/actions pause when the terminal is too small. Recommended: 120 × 36 or larger.
+
+## File explorer
+
+The **Files** workspace starts with the detected **Git repository root** (for example, `yoda-3/`), even when Kae is launched from a subdirectory. Changed files are grouped underneath it into expandable folders. Shared single-child folder chains are compacted (for example, `apps/portal/src`), but never merged into the project-root row. The root remains visible when the working tree is clean, with a zero count. File rows show Git's two-column status: **index first, working tree second**; `??` is untracked. Folder counts include changed descendants, and fully staged folders have a soft green indicator.
+
+- `j` / `k` moves through the tree. Enter toggles a folder or opens a file's diff; conflicts open the resolver.
+- Right / `l` expands or enters a folder; Left / `h` collapses it or moves to the nearest displayed parent. `Tab` switches tree/diff focus; in the diff, `h` / `l` scroll horizontally.
+- `s` on a folder reviews staging its changed files. `u` reviews unstaging them. The dialog lists the exact paths, including rename sources when needed, before typed `y` proceeds. Working files are retained; staged-only versions can be replaced or removed.
+- **Space toggles staging** for the selected file, folder, or project root. If the selection has unstaged changes (including partial staging), Space stages them; otherwise it reviews unstaging. Replacing staged-only versions, unstaging, and folder/root operations retain their confirmations. Space is not a staging shortcut in previews, History, prompts, or pasted input.
+- The root row supports the same expand/collapse and reviewed staging/unstaging controls, scoped to all changed files in that repository. It is a navigation row, not a file path passed to Git.
+- Bulk folder staging refuses unresolved conflicts: resolve and stage those files individually. Editing, hunk operations, discard, and conflict choices only work on file rows, never on an invisible previously selected file.
+- Folder expansion and selection are retained across refreshes. The selected path appears above the diff; long tree labels retain the filename end rather than repeating an unreadable path prefix.
+- Staged filenames use the theme's green; unresolved conflicts use its red. Unstaged/untracked filenames stay neutral. Partially staged files retain separate index/worktree status markers, so a green filename does not imply all its changes are staged.
+- While Git runs, tree/workspace navigation, scrolling, previews, and help remain available. Further mutations are locked, **not queued**, until the operation and refreshed status complete. Quit waits safely for the running Git command.
+
+After an index-only operation, Kae refreshes file status and the full safety guard but reuses history/branch metadata when HEAD, refs, operation, and upstream configuration are unchanged. External metadata changes trigger a full reload instead; manual and periodic refreshes still load the complete snapshot. Stale-state and changed-file-content checks are not skipped for speed.
+
+This is a **changed-files explorer**, not a filesystem editor: unchanged/ignored files and empty folders are not listed. It does not create files or folders.
+
+## Appearance and themes
+
+Kae defaults to **Catppuccin Mocha** with soft diff colors, neutral metadata, lavender focus, and your terminal's background and opacity. Other bundled themes are **Catppuccin Macchiato**, **Catppuccin Latte** (light), **Nord**, and **terminal** (your terminal's ANSI palette).
+
+From the main view, press `:` and choose **Change theme**. Up/down or `j`/`k` previews immediately, Enter saves, and Esc cancels without writing. Invalid themes show an error and cannot be saved. Browsing History remains Git-read-only.
+
+On interactive startup, Kae creates missing configuration/templates under `$XDG_CONFIG_HOME/kae`, or **`~/.config/kae`** when XDG_CONFIG_HOME is unset. Existing files are never replaced by initialization:
+
+```text
+~/.config/kae/
+├── config.toml
+└── themes/
+    ├── catppuccin-mocha.toml
+    ├── catppuccin-macchiato.toml
+    ├── catppuccin-latte.toml
+    ├── nord.toml
+    └── terminal.toml
+```
+
+```toml
+# config.toml
+theme = "catppuccin-mocha"
+transparent = true # default: inherit the terminal background and opacity
+```
+
+Set `transparent = false` to opt into a solid theme background. Existing explicit settings are preserved; if an earlier version created `transparent = false`, change it to `true` and restart to inherit terminal opacity. Selection and search highlights still use their theme colors.
+
+Copy a template to `themes/my-theme.toml`, edit it, then select **my-theme** in the picker. For example:
+
+```toml
+base = "catppuccin-mocha"
+accent = "#b4befe"
+added = "#a6e3a1"
+deleted = "#f38ba8"
+```
+
+Available color keys are `background`, `text`, `muted`, `border`, `accent`, `selection`, `added`, `deleted`, `warning`, `hunk`, `search`, `search_active`, and `search_text`. Colors accept `#RRGGBB` or `terminal`. Base names refer to bundled palettes; custom theme names allow letters, digits, hyphens, and underscores. Files named after a built-in override that theme's colors. Changes are read when opening/previewing the picker or restarting Kae.
+
+Invalid startup configuration falls back to Mocha with a visible error. Accepted theme changes are saved atomically, preserving other settings and comments; malformed config files are not overwritten. No repository configuration is changed.
 
 ## Browse a commit by file
 

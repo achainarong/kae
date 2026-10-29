@@ -4,6 +4,8 @@
 // Keeping the CLI as a single binary avoids publishing a premature library API.
 #[path = "../src/app.rs"]
 mod app;
+#[path = "../src/config.rs"]
+mod config;
 #[path = "../src/conflict.rs"]
 mod conflict;
 #[path = "../src/editor.rs"]
@@ -18,6 +20,10 @@ mod history;
 mod loader;
 #[path = "../src/rebase.rs"]
 mod rebase;
+#[path = "../src/theme.rs"]
+mod theme;
+#[path = "../src/tree.rs"]
+mod tree;
 #[path = "../src/ui.rs"]
 mod ui;
 
@@ -1007,6 +1013,39 @@ fn wait(app: &mut app::App) {
 }
 
 #[test]
+#[ignore = "Manual local profiling; uses only an isolated temporary repository"]
+fn profile_index_update_refresh() {
+    let fixture = Fixture::new();
+    for index in 0..1000 {
+        fixture.write(&format!("src/file-{index:04}"), "base\n");
+    }
+    fixture.commit("README", "base\n", "base");
+    for index in 0..128 {
+        fixture.write(
+            &format!("src/file-{index:04}"),
+            &"changed content\n".repeat(1024),
+        );
+    }
+    let started = Instant::now();
+    let snapshot = fixture.repo.snapshot().unwrap();
+    let snapshot_time = started.elapsed();
+    let started = Instant::now();
+    let output = fixture
+        .repo
+        .execute(&Action::new(&snapshot, "Stage file", &["add"]).path(Path::new("src/file-0000")))
+        .unwrap();
+    assert!(output.success);
+    let mutation_time = started.elapsed();
+    let started = Instant::now();
+    let refreshed = fixture.repo.refresh_index(&snapshot).unwrap();
+    let refresh_time = started.elapsed();
+    assert_eq!(refreshed.files.len(), 128);
+    eprintln!(
+        "PROFILE full snapshot={snapshot_time:?}; guarded stage={mutation_time:?}; post-stage refresh={refresh_time:?}"
+    );
+}
+
+#[test]
 fn ui_stage_commit_and_destructive_confirmation_flow() {
     let fixture = Fixture::new();
     fixture.write("file", "initial\n");
@@ -1676,7 +1715,7 @@ fn split_diffs_render_real_line_numbers_matches_and_narrow_fallback() {
             buffer
                 .content()
                 .iter()
-                .any(|cell| cell.bg == ratatui::style::Color::LightMagenta)
+                .any(|cell| cell.bg == app.theme.search_active)
         );
         if width >= 120 {
             assert!(text.contains("Old · parent") && text.contains("New · commit"));
@@ -1955,7 +1994,7 @@ fn searching_eof_annotations_keeps_the_match_visible_when_toggling_layouts() {
             .buffer()
             .content()
             .iter()
-            .filter(|cell| cell.bg == ratatui::style::Color::LightMagenta)
+            .filter(|cell| cell.bg == app.theme.search_active)
             .count()
             >= 10
     );
@@ -1971,10 +2010,586 @@ fn searching_eof_annotations_keeps_the_match_visible_when_toggling_layouts() {
             .buffer()
             .content()
             .iter()
-            .filter(|cell| cell.bg == ratatui::style::Color::LightMagenta)
+            .filter(|cell| cell.bg == app.theme.search_active)
             .count()
             >= 10
     );
+}
+
+fn select_folder(app: &mut app::App, path: &str) {
+    app.focus = app::Focus::List;
+    app.explorer.cursor = app
+        .explorer
+        .rows
+        .iter()
+        .position(|row| row.file.is_none() && row.path == Path::new(path))
+        .unwrap();
+}
+
+#[test]
+fn explorer_uses_detected_project_root_when_launched_inside_a_subdirectory() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let fixture = Fixture::new();
+    fixture.write("apps/portal/src/a", "base\n");
+    fixture.commit("root-file", "base\n", "base");
+    fixture.write("apps/portal/src/a", "modified\n");
+    fixture.write("root-file", "modified\n");
+    let mut app = app::App::ready(&fixture.repo.root.join("apps/portal/src")).unwrap();
+    assert_eq!(
+        fs::canonicalize(&app.repo.root).unwrap(),
+        fs::canonicalize(&fixture.repo.root).unwrap()
+    );
+    let root = &app.explorer.rows[0];
+    assert!(root.path.as_os_str().is_empty());
+    assert_eq!(root.name, fixture.repo.root.file_name().unwrap());
+    assert_eq!(root.count, 2);
+    assert_eq!(root.depth, 0);
+    assert_eq!(app.explorer.rows[1].name, "apps/portal/src");
+    assert_eq!(app.explorer.rows[1].depth, 1);
+    key(&mut app, KeyCode::Home);
+    assert!(!app.file_selected());
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.explorer.rows.len(), 1);
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert_eq!(app.explorer.rows.len(), 1);
+    assert_eq!(app.explorer.selected().unwrap().count, 2);
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains(&format!(
+        "{}/ 2",
+        fixture.repo.root.file_name().unwrap().to_string_lossy()
+    )));
+    key(&mut app, KeyCode::Right);
+    assert!(app.explorer.rows.len() > 1);
+}
+
+#[test]
+fn project_root_supports_reviewed_staging_and_remains_visible_when_clean() {
+    let fixture = Fixture::new();
+    fixture.write("src/a", "base\n");
+    fixture.commit("root-file", "base\n", "base");
+    fixture.write("src/a", "changed\n");
+    fixture.write("root-file", "changed\n");
+    let before = fixture.repo.guard().unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Home);
+    key(&mut app, KeyCode::Char('s'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Confirm { task: app::Task::Git(action), detail }) if detail.contains(&fixture.repo.root.display().to_string()) && action.args.iter().all(|arg| !arg.is_empty()))
+    );
+    key(&mut app, KeyCode::Char('n'));
+    fixture.repo.verify(&before).unwrap();
+    key(&mut app, KeyCode::Char('s'));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert_eq!(
+        fixture
+            .action(&["diff", "--cached", "--name-only"])
+            .text()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(app.explorer.selected().unwrap().path.as_os_str().is_empty());
+    key(&mut app, KeyCode::Char('u'));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(
+        fixture
+            .action(&["diff", "--cached", "--name-only"])
+            .text()
+            .is_empty()
+    );
+    fixture.write("src/a", "base\n");
+    fixture.write("root-file", "base\n");
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert_eq!(app.explorer.rows.len(), 1);
+    assert_eq!(app.explorer.rows[0].count, 0);
+    assert!(app.preview.contains("Working tree is clean"));
+    render_views(&app);
+}
+
+#[test]
+fn staging_files_and_folders_with_spaces_preserves_literal_paths() {
+    let fixture = Fixture::new();
+    fixture.write("folder with spaces/a file.txt", "first\n");
+    fixture.write("folder with spaces/another file.txt", "second\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    assert!(app.file_selected());
+    key(&mut app, KeyCode::Char('s'));
+    wait(&mut app);
+    assert_eq!(fixture.action(&["ls-files"]).text().lines().count(), 1);
+    key(&mut app, KeyCode::Char('u'));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(fixture.action(&["ls-files"]).text().is_empty());
+    select_folder(&mut app, "folder with spaces");
+    key(&mut app, KeyCode::Char('s'));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    let staged = fixture.action(&["ls-files"]).text();
+    assert!(staged.contains("folder with spaces/a file.txt"));
+    assert!(staged.contains("folder with spaces/another file.txt"));
+    assert_eq!(staged.lines().count(), 2);
+}
+
+#[test]
+fn space_toggles_file_staging_and_partial_staging_still_requires_review() {
+    let fixture = Fixture::new();
+    fixture.commit("file with spaces", "base\n", "base");
+    fixture.write("file with spaces", "changed\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char(' '));
+    wait(&mut app);
+    assert!(
+        fixture
+            .action(&["diff", "--cached"])
+            .text()
+            .contains("+changed")
+    );
+    key(&mut app, KeyCode::Char(' '));
+    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(
+        fixture
+            .action(&["diff", "--cached", "--name-only"])
+            .text()
+            .is_empty()
+    );
+    key(&mut app, KeyCode::Char(' '));
+    wait(&mut app);
+    fixture.write("file with spaces", "newer\n");
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    key(&mut app, KeyCode::Char(' '));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Confirm { detail, .. }) if detail.contains("Replace the staged version"))
+    );
+    key(&mut app, KeyCode::Char('n'));
+    assert!(
+        fixture
+            .action(&["diff", "--cached"])
+            .text()
+            .contains("+changed")
+    );
+    key(&mut app, KeyCode::Char(' '));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(
+        fixture
+            .action(&["diff", "--cached"])
+            .text()
+            .contains("+newer")
+    );
+}
+
+#[test]
+fn space_targets_folders_and_project_root_but_not_previews_prompts_or_paste() {
+    let fixture = Fixture::new();
+    fixture.write("src/a", "a\n");
+    fixture.write("outside", "outside\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    select_folder(&mut app, "src");
+    key(&mut app, KeyCode::Char(' '));
+    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
+    app.handle_paste("y ");
+    assert!(app.busy.is_none());
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert_eq!(fixture.action(&["ls-files"]).text().trim(), "src/a");
+    key(&mut app, KeyCode::Char(' '));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(fixture.action(&["ls-files"]).text().is_empty());
+    key(&mut app, KeyCode::Home);
+    key(&mut app, KeyCode::Char(' '));
+    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert_eq!(fixture.action(&["ls-files"]).text().lines().count(), 2);
+    key(&mut app, KeyCode::Char(' '));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(fixture.action(&["ls-files"]).text().is_empty());
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char(' '));
+    assert!(app.modal.is_none() && app.busy.is_none());
+    key(&mut app, KeyCode::Char('b'));
+    key(&mut app, KeyCode::Char(' '));
+    assert!(matches!(&app.modal, Some(app::Modal::Prompt { input, .. }) if input == " "));
+    key(&mut app, KeyCode::Esc);
+    assert!(fixture.action(&["ls-files"]).text().is_empty());
+}
+
+#[test]
+fn index_refresh_reuses_metadata_only_until_refs_head_or_configuration_change() {
+    let fixture = Fixture::new();
+    fixture.commit("file", "base\n", "base");
+    fixture.write("file", "changed\n");
+    let snapshot = fixture.repo.snapshot().unwrap();
+    let output = fixture
+        .repo
+        .execute(&Action::new(&snapshot, "Stage", &["add"]).path(Path::new("file")))
+        .unwrap();
+    assert!(output.success);
+    let updated = fixture.repo.refresh_index(&snapshot).unwrap();
+    assert_eq!(updated.files[0].status, "M ");
+    assert_eq!(updated.commits[0].oid, snapshot.commits[0].oid);
+    fixture.repo.verify(&updated.guard).unwrap();
+    fixture.success(&["tag", "external-tag"]);
+    let tagged = fixture.repo.refresh_index(&updated).unwrap();
+    assert!(tagged.tags.contains(&"external-tag".into()));
+    fixture.success(&["switch", "-c", "external-branch"]);
+    let branched = fixture.repo.refresh_index(&tagged).unwrap();
+    assert_eq!(branched.branch, "external-branch");
+    fixture.success(&[
+        "remote",
+        "add",
+        "external-remote",
+        "https://example.invalid/repo",
+    ]);
+    let configured = fixture.repo.refresh_index(&branched).unwrap();
+    assert!(configured.remotes.contains(&"external-remote".into()));
+    fixture.repo.verify(&configured.guard).unwrap();
+    fixture.write("file", "external change after refresh\n");
+    assert!(
+        fixture
+            .repo
+            .execute(&Action::new(&configured, "Stage stale", &["add"]).path(Path::new("file")))
+            .is_err()
+    );
+}
+
+#[test]
+fn operation_markers_are_checked_in_the_linked_worktrees_own_git_directory() {
+    let fixture = Fixture::new();
+    fixture.base();
+    let worktree = tempfile::tempdir().unwrap();
+    fixture.success(&[
+        "worktree",
+        "add",
+        "--detach",
+        worktree.path().to_str().unwrap(),
+        "HEAD",
+    ]);
+    let linked = Repo::discover(worktree.path()).unwrap();
+    fs::write(
+        linked.git_path("CHERRY_PICK_HEAD").unwrap(),
+        fixture.repo.head().unwrap().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(linked.operation().unwrap(), Some(Operation::CherryPick));
+    assert_eq!(fixture.repo.operation().unwrap(), None);
+}
+
+#[test]
+fn working_tree_explorer_compacts_paths_and_stages_only_the_reviewed_folder() {
+    let fixture = Fixture::new();
+    fixture.write("apps/portal/src/feature/a.ts", "base a\n");
+    fixture.write("apps/portal/src/feature/b.ts", "base b\n");
+    fixture.commit("outside", "base\n", "base");
+    fixture.write("apps/portal/src/feature/a.ts", "new a\n");
+    fixture.write("apps/portal/src/feature/b.ts", "new b\n");
+    fixture.write("outside", "outside change\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    assert!(
+        app.explorer
+            .rows
+            .iter()
+            .any(|row| row.name == "apps/portal/src/feature" && row.count == 2)
+    );
+    select_folder(&mut app, "apps/portal/src/feature");
+    assert!(!app.file_selected());
+    key(&mut app, KeyCode::Char('s'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Confirm { detail, .. }) if detail.contains("a.ts") && detail.contains("b.ts") && !detail.contains("outside change"))
+    );
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    let staged = fixture.action(&["diff", "--cached", "--name-only"]).text();
+    assert!(staged.contains("a.ts") && staged.contains("b.ts") && !staged.contains("outside"));
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("outside")).unwrap(),
+        "outside change\n"
+    );
+    select_folder(&mut app, "apps/portal/src/feature");
+    key(&mut app, KeyCode::Char('u'));
+    assert!(matches!(&app.modal, Some(app::Modal::Confirm { .. })));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(
+        fixture
+            .action(&["diff", "--cached", "--name-only"])
+            .text()
+            .is_empty()
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("apps/portal/src/feature/a.ts")).unwrap(),
+        "new a\n"
+    );
+    render_views(&app);
+}
+
+#[test]
+fn explorer_refresh_keeps_collapsed_folders_and_file_actions_cannot_target_folders() {
+    let fixture = Fixture::new();
+    fixture.write("src/nested/a", "a\n");
+    fixture.commit("src/nested/b", "b\n", "base");
+    fixture.write("src/nested/a", "changed\n");
+    fixture.write("src/nested/b", "changed\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    select_folder(&mut app, "src/nested");
+    key(&mut app, KeyCode::Enter);
+    assert!(app.explorer.collapsed.contains(Path::new("src/nested")));
+    for command in [
+        app::CommandId::Discard,
+        app::CommandId::Edit,
+        app::CommandId::Hunks,
+        app::CommandId::TakeCurrent,
+    ] {
+        assert!(!command.available(&app));
+    }
+    key(&mut app, KeyCode::Char('e'));
+    assert!(app.modal.is_none());
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert!(app.explorer.collapsed.contains(Path::new("src/nested")));
+    assert!(!app.file_selected());
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Right);
+    wait(&mut app);
+    assert!(app.file_selected());
+    assert_eq!(app.explorer.selected().unwrap().file, Some(app.selected));
+    assert!(app.preview.contains("+changed"));
+    render_views(&app);
+}
+
+#[test]
+fn folder_unstage_handles_unborn_head_and_untracked_siblings() {
+    let fixture = Fixture::new();
+    fixture.write("src/a", "a\n");
+    fixture.write("src/b", "b\n");
+    fixture.success(&["add", "src/a"]);
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    select_folder(&mut app, "src");
+    key(&mut app, KeyCode::Char('u'));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(fixture.action(&["ls-files"]).text().is_empty());
+    assert!(fixture.repo.root.join("src/a").exists() && fixture.repo.root.join("src/b").exists());
+}
+
+#[test]
+fn folder_staging_refuses_unresolved_conflicts() {
+    let fixture = Fixture::new();
+    fixture.commit("src/file", "base\n", "base");
+    fixture.success(&["switch", "-c", "side"]);
+    fixture.commit("src/file", "side\n", "side");
+    fixture.success(&["switch", "main"]);
+    fixture.commit("src/file", "main\n", "main");
+    assert!(!fixture.action(&["merge", "side"]).success);
+    let before = fixture.repo.guard().unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    select_folder(&mut app, "src");
+    key(&mut app, KeyCode::Char('s'));
+    assert!(
+        app.modal.is_none()
+            && app
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("individually"))
+    );
+    fixture.repo.verify(&before).unwrap();
+}
+
+fn open_theme_picker(app: &mut app::App) {
+    key(app, KeyCode::Char(':'));
+    app.handle_paste("Change theme");
+    key(app, KeyCode::Enter);
+    assert!(matches!(app.modal, Some(app::Modal::Theme { .. })));
+}
+
+#[test]
+fn theme_picker_previews_cancels_and_persists_without_changing_git() {
+    let fixture = Fixture::new();
+    fixture.base();
+    let before = fixture.repo.guard().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    config::Config::initialize(root.path()).unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    app.config_root = Some(root.path().into());
+    app.config = config::Config::default();
+    app.theme = app.config.resolve(root.path(), &app.config.theme).unwrap();
+    let original = app.theme.accent;
+    assert_eq!(app.theme.background, ratatui::style::Color::Reset);
+    open_theme_picker(&mut app);
+    key(&mut app, KeyCode::Down);
+    assert_ne!(app.theme.accent, original);
+    assert_eq!(app.theme.background, ratatui::style::Color::Reset);
+    render_views(&app);
+    key(&mut app, KeyCode::Esc);
+    assert_eq!(app.theme.accent, original);
+    assert_eq!(app.theme.background, ratatui::style::Color::Reset);
+    assert_eq!(
+        config::Config::load(root.path()).unwrap().theme,
+        "catppuccin-mocha"
+    );
+    open_theme_picker(&mut app);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Enter);
+    assert!(app.modal.is_none());
+    assert_eq!(
+        config::Config::load(root.path()).unwrap().theme,
+        app.config.theme
+    );
+    assert_ne!(app.theme.accent, original);
+    assert_eq!(app.theme.background, ratatui::style::Color::Reset);
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
+fn theme_picker_rejects_broken_custom_themes_and_does_not_overwrite_config() {
+    let fixture = Fixture::new();
+    fixture.base();
+    let root = tempfile::tempdir().unwrap();
+    config::Config::initialize(root.path()).unwrap();
+    fs::write(
+        root.path().join("themes/zz-broken.toml"),
+        "added = 'NOT A COLOR'",
+    )
+    .unwrap();
+    let original = fs::read(root.path().join("config.toml")).unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    app.config_root = Some(root.path().into());
+    app.config = config::Config::default();
+    open_theme_picker(&mut app);
+    for _ in 0..10 {
+        key(&mut app, KeyCode::Down);
+    }
+    assert!(
+        app.error
+            .as_ref()
+            .is_some_and(|error| error.contains("Invalid theme"))
+    );
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.modal, Some(app::Modal::Theme { .. })));
+    assert_eq!(fs::read(root.path().join("config.toml")).unwrap(), original);
+    key(&mut app, KeyCode::Esc);
+}
+
+#[test]
+fn terminal_background_survives_theme_changes_and_dialog_rendering() {
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    let fixture = Fixture::new();
+    fixture.base();
+    let root = tempfile::tempdir().unwrap();
+    config::Config::initialize(root.path()).unwrap();
+    let config = config::Config::load(root.path()).unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    for name in theme::PRESETS {
+        app.theme = config.resolve(root.path(), name).unwrap();
+        for modal in [
+            None,
+            Some(app::Modal::Help { scroll: 0 }),
+            Some(app::Modal::Palette {
+                filter: String::new(),
+                selected: 0,
+            }),
+            Some(app::Modal::Output {
+                title: "test".into(),
+                text: "+added\n-removed".into(),
+                scroll: 0,
+                horizontal: 0,
+            }),
+            Some(app::Modal::Theme {
+                names: vec![name.to_string()],
+                selected: 0,
+                original: app.theme.clone(),
+            }),
+        ] {
+            app.modal = modal;
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(
+                buffer[(139, 39)].bg,
+                Color::Reset,
+                "{name}: footer background"
+            );
+            assert_eq!(
+                buffer[(139, 20)].bg,
+                Color::Reset,
+                "{name}: pane/dialog background"
+            );
+            assert_eq!(
+                buffer[(139, 0)].bg,
+                Color::Reset,
+                "{name}: header background"
+            );
+        }
+    }
+}
+
+#[test]
+fn folder_unstage_reviews_rename_sources_outside_the_folder() {
+    let fixture = Fixture::new();
+    fixture.commit("old", "rename me\n", "base");
+    fs::create_dir(fixture.repo.root.join("target-dir")).unwrap();
+    fixture.success(&["mv", "old", "target-dir/new"]);
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    select_folder(&mut app, "target-dir");
+    key(&mut app, KeyCode::Char('u'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Confirm { detail, .. }) if detail.contains("old") && detail.contains("target-dir/new"))
+    );
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(
+        fixture
+            .action(&["diff", "--cached", "--name-only"])
+            .text()
+            .is_empty()
+    );
+    assert!(!fixture.repo.root.join("old").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("target-dir/new")).unwrap(),
+        "rename me\n"
+    );
+}
+
+#[test]
+fn folder_staging_literal_names_and_partial_staging_are_confirmed() {
+    let fixture = Fixture::new();
+    fixture.write("[folder]/a", "base\n");
+    fixture.commit("folder/a", "base\n", "base");
+    fixture.write("[folder]/a", "staged\n");
+    fixture.success(&["add", "--", "[folder]/a"]);
+    fixture.write("[folder]/a", "working\n");
+    fixture.write("folder/a", "unrelated\n");
+    let before = fixture.repo.guard().unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    select_folder(&mut app, "[folder]");
+    key(&mut app, KeyCode::Char('s'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Confirm { detail, .. }) if detail.contains("staged-only"))
+    );
+    key(&mut app, KeyCode::Char('n'));
+    fixture.repo.verify(&before).unwrap();
+    key(&mut app, KeyCode::Char('s'));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    let staged = fixture.action(&["diff", "--cached"]).text();
+    assert!(staged.contains("+working") && !staged.contains("unrelated"));
 }
 
 #[cfg(unix)]

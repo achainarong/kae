@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
@@ -13,10 +13,8 @@ use crate::{
     git::Hunks,
     history::{CellKind, DiffCell, DiffLayout, Search},
     rebase::{Plan, RebaseAction},
+    theme::Theme,
 };
-
-const ACCENT: Color = Color::Cyan;
-const MUTED: Color = Color::DarkGray;
 
 pub fn minimum_size(app: &App) -> (u16, u16) {
     if matches!(
@@ -37,7 +35,12 @@ pub fn minimum_size(app: &App) -> (u16, u16) {
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    let theme = &app.theme;
     let area = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().fg(theme.text).bg(theme.background)),
+        area,
+    );
     let (minimum_width, minimum_height) = minimum_size(app);
     if area.width < minimum_width || area.height < minimum_height {
         frame.render_widget(
@@ -51,7 +54,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(1),
     ])
     .split(area);
     let repo = app
@@ -69,15 +72,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" kae ", Style::default().fg(Color::Black).bg(ACCENT).bold()),
+            Span::styled(
+                " kae ",
+                Style::default()
+                    .fg(theme.search_text)
+                    .bg(theme.accent)
+                    .bold(),
+            ),
             Span::raw(format!("  {} / ", safe_text(&repo))),
             Span::styled(
                 safe_text(&app.snapshot.branch),
-                Style::default().fg(ACCENT).bold(),
+                Style::default().fg(theme.accent).bold(),
             ),
             Span::styled(
                 format!("   {}", safe_text(&tracking)),
-                Style::default().fg(MUTED),
+                Style::default().fg(theme.muted),
             ),
         ])),
         rows[0],
@@ -97,7 +106,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tabs::new(tabs)
             .select(app.workspace.index())
             .divider(" ")
-            .highlight_style(Style::default().fg(ACCENT).bold()),
+            .highlight_style(Style::default().fg(theme.accent).bold()),
         rows[1],
     );
 
@@ -127,11 +136,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 let color = if app.workspace == Workspace::Files
                     && app.snapshot.files[index].is_conflict()
                 {
-                    Color::Red
-                } else if app.workspace == Workspace::History {
-                    Color::LightBlue
+                    theme.deleted
                 } else {
-                    Color::Reset
+                    theme.text
                 };
                 ListItem::new(text).style(Style::default().fg(color))
             })
@@ -147,24 +154,44 @@ pub fn draw(frame: &mut Frame, app: &App) {
             }
         );
         let list = List::new(items)
-            .block(panel(title, app.focus == Focus::List))
-            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White).bold())
+            .block(panel(theme, title, app.focus == Focus::List))
+            .highlight_style(Style::default().bg(theme.selection).fg(theme.text).bold())
             .highlight_symbol("› ");
         let mut state = ListState::default().with_selected(if app.items().is_empty() {
             None
         } else {
             Some(app.selected)
         });
-        frame.render_stateful_widget(list, panes[0], &mut state);
+        if app.workspace == Workspace::Files {
+            draw_explorer(frame, app, panes[0]);
+        } else {
+            frame.render_stateful_widget(list, panes[0], &mut state);
+        }
         frame.render_widget(
             Paragraph::new(diff_window(
+                theme,
                 &app.preview,
                 usize::from(app.scroll),
                 panes[1].height.saturating_sub(2),
             ))
             .scroll((0, app.horizontal))
             .block(panel(
-                " Diff / details · Enter browse commit · Tab focus ".into(),
+                theme,
+                if app.workspace == Workspace::Files {
+                    app.explorer
+                        .selected()
+                        .map(|row| {
+                            let path = if row.path.as_os_str().is_empty() {
+                                &app.repo.root
+                            } else {
+                                &row.path
+                            };
+                            format!(" {} ", safe_text(&path.to_string_lossy()))
+                        })
+                        .unwrap_or_else(|| " Working tree ".into())
+                } else {
+                    " Diff / details · Enter browse commit · Tab focus ".into()
+                },
                 app.focus == Focus::Preview,
             )),
             panes[1],
@@ -181,63 +208,198 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .map(|operation| operation.label())
         .unwrap_or("Ready");
     let (message, color) = if let Some(error) = &app.error {
-        (error.as_str(), Color::Red)
+        (error.as_str(), theme.deleted)
     } else if let Some(busy) = &app.busy {
-        (busy.as_str(), Color::Yellow)
+        (busy.as_str(), theme.warning)
     } else if app.loading() {
-        ("Loading repository / preview…", MUTED)
+        ("Loading repository / preview…", theme.muted)
     } else {
-        (app.notice.as_str(), MUTED)
+        (app.notice.as_str(), theme.muted)
     };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                format!(
-                    " {status} · {} conflicted files",
-                    app.snapshot
-                        .files
-                        .iter()
-                        .filter(|file| file.is_conflict())
-                        .count()
-                ),
-                Style::default().fg(if app.snapshot.operation.is_some() {
-                    Color::Yellow
-                } else {
-                    MUTED
-                }),
-            ),
-            Line::styled(
-                format!(
-                    " {}{}",
-                    if app.busy.is_some() {
-                        "Running · "
-                    } else {
-                        ""
-                    },
-                    safe_text(message)
-                ),
-                Style::default().fg(color),
-            ),
-            Line::raw(if app.quit_requested {
-                " Quit requested — waiting for Git to finish safely."
-            } else if app.busy.is_some() {
-                " Git is running · ? help · q / Ctrl-C quit after completion"
-            } else if matches!(app.modal, Some(Modal::Commit(_))) {
-                " History browser · read only · Esc returns to history · [/] file · / find · d layout"
-            } else {
-                " : commands · ? help · Tab focus · r refresh · !/~ details · q quit"
-            }),
-        ]),
+        Paragraph::new(Line::styled(
+            if app.quit_requested { " Waiting for Git to finish before quitting".into() }
+            else if app.error.is_some() || app.busy.is_some() || app.loading() { format!(" {}", safe_text(message)) }
+            else if app.modal.is_some() { format!(" {status} · Esc back · : Change theme from main view") }
+            else if app.workspace == Workspace::Files { format!(" {status} · Enter folder/file · s stage · u unstage · Tab diff · : commands · ? help") }
+            else { format!(" {status} · {} · : commands · ? help · q quit", safe_text(message)) },
+            Style::default().fg(color),
+        )),
         rows[3],
     );
 }
 
+fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let items = app
+        .explorer
+        .rows
+        .iter()
+        .map(|row| {
+            let indent = "  ".repeat(
+                row.depth
+                    .min(usize::from(area.width.saturating_sub(20) / 2)),
+            );
+            let name = safe_text(&row.name.to_string_lossy());
+            match row.file.and_then(|index| app.snapshot.files.get(index)) {
+                Some(file) => {
+                    let status = file.status.as_bytes();
+                    let staged = !matches!(status[0], b' ' | b'?');
+                    let color = if file.is_conflict() {
+                        theme.deleted
+                    } else if staged {
+                        theme.added
+                    } else {
+                        theme.text
+                    };
+                    let index_color = if file.is_conflict() {
+                        theme.deleted
+                    } else if staged {
+                        theme.added
+                    } else if status[0] == b'?' {
+                        theme.warning
+                    } else {
+                        theme.muted
+                    };
+                    let worktree_color = if file.is_conflict() {
+                        theme.deleted
+                    } else if status[1] == b'?' {
+                        theme.warning
+                    } else {
+                        theme.muted
+                    };
+                    let gutter = format!("{indent}  {} ", file.status);
+                    let width = area
+                        .width
+                        .saturating_sub(4)
+                        .saturating_sub(Span::raw(&gutter).width() as u16);
+                    ListItem::new(Line::from(vec![
+                        Span::raw(indent),
+                        Span::raw("  "),
+                        Span::styled(
+                            (status[0] as char).to_string(),
+                            Style::default().fg(index_color),
+                        ),
+                        Span::styled(
+                            (status[1] as char).to_string(),
+                            Style::default().fg(worktree_color),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(tail_name(&name, width), Style::default().fg(color)),
+                    ]))
+                }
+                None => {
+                    let files = app
+                        .snapshot
+                        .files
+                        .iter()
+                        .filter(|file| file.path.starts_with(&row.path));
+                    let (mut staged, mut working) = (0, 0);
+                    for file in files {
+                        let status = file.status.as_bytes();
+                        staged += usize::from(!matches!(status[0], b' ' | b'?'));
+                        working += usize::from(status[1] != b' ');
+                    }
+                    let prefix = format!(
+                        "{indent}{} ",
+                        if app.explorer.collapsed.contains(&row.path) {
+                            "▸"
+                        } else {
+                            "▾"
+                        }
+                    );
+                    let suffix = format!("/ {}", row.count);
+                    let width = area.width.saturating_sub(4).saturating_sub(
+                        (Span::raw(&prefix).width() + Span::raw(&suffix).width()) as u16,
+                    );
+                    ListItem::new(Line::from(vec![
+                        Span::raw(prefix),
+                        Span::raw(tail_name(&name, width)),
+                        Span::styled(suffix, Style::default().fg(theme.muted)),
+                    ]))
+                    .style(Style::default().fg(
+                        if staged > 0 && working == 0 {
+                            theme.added
+                        } else {
+                            theme.muted
+                        },
+                    ))
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected = if items.is_empty() {
+        None
+    } else {
+        Some(app.explorer.cursor)
+    };
+    let list = List::new(items)
+        .block(panel(
+            theme,
+            format!(
+                " Changes · {} files · index/worktree ",
+                app.snapshot.files.len()
+            ),
+            app.focus == Focus::List,
+        ))
+        .highlight_style(Style::default().bg(theme.selection).bold())
+        .highlight_symbol("› ");
+    frame.render_stateful_widget(
+        list,
+        area,
+        &mut ListState::default().with_selected(selected),
+    );
+}
+
+fn tail_name(name: &str, width: u16) -> String {
+    if Span::raw(name).width() <= usize::from(width) {
+        return name.into();
+    }
+    let mut tail = String::new();
+    let mut remaining = usize::from(width).saturating_sub(1);
+    for character in name.chars().rev() {
+        let size = Span::raw(character.to_string()).width();
+        if size > remaining {
+            break;
+        }
+        tail.insert(0, character);
+        remaining -= size;
+    }
+    format!("…{tail}")
+}
+
 fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
+    let theme = &app.theme;
     frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().fg(theme.text).bg(theme.background)),
+        area,
+    );
     match modal {
+        Modal::Theme {
+            names, selected, ..
+        } => {
+            let items = names
+                .iter()
+                .map(|name| ListItem::new(safe_text(name)))
+                .collect::<Vec<_>>();
+            let list = List::new(items)
+                .block(panel(
+                    theme,
+                    " Themes · ↑/↓ preview · Enter save · Esc cancel ".into(),
+                    true,
+                ))
+                .highlight_style(Style::default().bg(theme.selection).fg(theme.accent))
+                .highlight_symbol("› ");
+            frame.render_stateful_widget(
+                list,
+                area,
+                &mut ListState::default().with_selected(Some(*selected)),
+            );
+        }
         Modal::Loading(label) => frame.render_widget(
             Paragraph::new(format!("\n{}\n\nEsc / q cancel loading", safe_text(label)))
-                .block(panel(" Loading · read only ".into(), true)),
+                .block(panel(theme, " Loading · read only ".into(), true)),
             area,
         ),
         Modal::Help { scroll } => {
@@ -266,12 +428,13 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                     "r refresh (also automatic every 2s outside dialogs) · ~ output · q close/quit\n",
                     "Network auth must be configured externally; no automatic force pushes."
                 )
-            ).wrap(Wrap { trim: false }).scroll((*scroll, 0)).block(panel(" Help · j/k scroll · Esc close ".into(), true)), area);
+            ).wrap(Wrap { trim: false }).scroll((*scroll, 0)).block(panel(theme, " Help · j/k scroll · Esc close ".into(), true)), area);
         }
         Modal::Palette { filter, selected } => {
             let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
             frame.render_widget(
                 Paragraph::new(safe_text(filter)).block(panel(
+                    theme,
                     " Command search · type to filter · Esc cancel ".into(),
                     true,
                 )),
@@ -285,7 +448,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                     .collect::<Vec<_>>(),
             )
             .highlight_symbol("› ")
-            .highlight_style(Style::default().fg(ACCENT).bold())
+            .highlight_style(Style::default().fg(theme.accent).bg(theme.selection).bold())
             .block(Block::bordered().title(" ↑/↓ select · Enter execute "));
             let mut state = ListState::default().with_selected(if commands.is_empty() {
                 None
@@ -301,16 +464,18 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                 input.lines().map(safe_text).collect::<Vec<_>>().join("\n")
             );
             frame.render_widget(
-                Paragraph::new(text)
-                    .wrap(Wrap { trim: false })
-                    .block(panel(" Input ".into(), true)),
+                Paragraph::new(text).wrap(Wrap { trim: false }).block(panel(
+                    theme,
+                    " Input ".into(),
+                    true,
+                )),
                 area,
             );
         }
         Modal::Confirm { detail, .. } => {
             let block = Block::bordered()
                 .title(" Review action · j/k scroll · confirmation required ")
-                .border_style(Style::default().fg(Color::Yellow));
+                .border_style(Style::default().fg(theme.warning));
             let inner = block.inner(area);
             frame.render_widget(block, area);
             let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
@@ -333,12 +498,14 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
         } => {
             frame.render_widget(
                 Paragraph::new(diff_window(
+                    theme,
                     text,
                     usize::from(*scroll),
                     area.height.saturating_sub(2),
                 ))
                 .scroll((0, *horizontal))
                 .block(panel(
+                    theme,
                     format!(
                         " {} · j/k scroll · h/l horizontal · Esc close ",
                         safe_text(title)
@@ -348,19 +515,19 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                 area,
             );
         }
-        Modal::Conflict(conflict) => draw_conflict(frame, conflict, area),
+        Modal::Conflict(conflict) => draw_conflict(theme, frame, conflict, area),
         Modal::Inline { editor, .. } => {
             let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
             frame.render_widget(&editor.area, rows[0]);
             frame.render_widget(Paragraph::new("Type to edit · arrows / Home / End move · Ctrl-Z undo · Ctrl-Y redo\nCtrl-S review save (not stage) · Esc keep draft and return · q inserts text"), rows[1]);
         }
-        Modal::Commit(view) => draw_commit(frame, view, area),
-        Modal::Hunks(hunks) => draw_hunks(frame, hunks, area),
-        Modal::Rebase(plan) => draw_rebase(frame, plan, area),
+        Modal::Commit(view) => draw_commit(theme, frame, view, area),
+        Modal::Hunks(hunks) => draw_hunks(theme, frame, hunks, area),
+        Modal::Rebase(plan) => draw_rebase(theme, frame, plan, area),
     }
 }
 
-fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
+fn draw_conflict(theme: &Theme, frame: &mut Frame, conflict: &Conflict, area: Rect) {
     let rows = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
@@ -406,7 +573,7 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
                 "saved / unchanged"
             }
         ))
-        .style(Style::default().fg(ACCENT).bold()),
+        .style(Style::default().fg(theme.text).bold()),
         rows[0],
     );
     let wide = area.width >= 100;
@@ -429,9 +596,10 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
         })
         .split(body[0]);
     frame.render_widget(
-        Paragraph::new(word_diff(current, incoming, true))
+        Paragraph::new(word_diff(theme, current, incoming, true))
             .scroll((conflict.scroll, conflict.horizontal))
             .block(panel(
+                theme,
                 format!(" {} ", safe_text(&conflict.current_label)),
                 false,
             )),
@@ -441,6 +609,7 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
     if conflict.show_base {
         frame.render_widget(
             Paragraph::new(diff_text(
+                theme,
                 region
                     .and_then(|region| region.base.as_deref())
                     .or(conflict.base_file.as_deref())
@@ -448,6 +617,7 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
             ))
             .scroll((conflict.scroll, conflict.horizontal))
             .block(panel(
+                theme,
                 if region.is_some_and(|region| region.base.is_some()) {
                     " Common ancestor · region "
                 } else {
@@ -460,21 +630,23 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
         );
     }
     frame.render_widget(
-        Paragraph::new(word_diff(current, incoming, false))
+        Paragraph::new(word_diff(theme, current, incoming, false))
             .scroll((conflict.scroll, conflict.horizontal))
             .block(panel(
+                theme,
                 format!(" {} ", safe_text(&conflict.incoming_label)),
                 false,
             )),
         top[right],
     );
     frame.render_widget(
-        Paragraph::new(diff_text(&conflict.result()))
+        Paragraph::new(diff_text(theme, &conflict.result()))
             .scroll((
                 conflict.result_offset().saturating_add(conflict.scroll),
                 conflict.horizontal,
             ))
             .block(panel(
+                theme,
                 " Result · e inline edit · E external · s review save ".into(),
                 true,
             )),
@@ -487,15 +659,15 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(if conflict.confirm_close {
-            Color::Yellow
+            theme.warning
         } else {
-            ACCENT
+            theme.muted
         })),
         rows[2],
     );
 }
 
-fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
+fn draw_commit(theme: &Theme, frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
     let rows = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
@@ -559,7 +731,7 @@ fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
             path,
             matches
         ))
-        .style(Style::default().fg(ACCENT)),
+        .style(Style::default().fg(theme.muted)),
         rows[0],
     );
     let panes = split(rows[1], 32);
@@ -595,7 +767,7 @@ fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
                     safe_text(&row.name.to_string_lossy()),
                     row.count
                 ))
-                .style(Style::default().fg(ACCENT)),
+                .style(Style::default().fg(theme.muted)),
             }
         })
         .collect::<Vec<_>>();
@@ -607,17 +779,18 @@ fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
     frame.render_stateful_widget(
         List::new(items)
             .block(panel(
+                theme,
                 " Changed files · folders ".into(),
                 view.focus == Focus::List,
             ))
             .highlight_symbol("› ")
-            .highlight_style(Style::default().bg(Color::DarkGray).bold()),
+            .highlight_style(Style::default().bg(theme.selection).fg(theme.text).bold()),
         panes[0],
         &mut state,
     );
     if view.history.loading {
         frame.render_widget(
-            Paragraph::new("Loading file…").block(panel(" File preview ".into(), true)),
+            Paragraph::new("Loading file…").block(panel(theme, " File preview ".into(), true)),
             panes[1],
         );
     } else if side_by_side {
@@ -634,6 +807,7 @@ fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
                 .take(usize::from(column.height.saturating_sub(2)))
                 .map(|row| {
                     split_line(
+                        theme,
                         if left {
                             row.left.as_ref()
                         } else {
@@ -653,7 +827,11 @@ fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
                 " New · commit "
             };
             frame.render_widget(
-                Paragraph::new(lines).block(panel(title.into(), view.focus == Focus::Preview)),
+                Paragraph::new(lines).block(panel(
+                    theme,
+                    title.into(),
+                    view.focus == Focus::Preview,
+                )),
                 column,
             );
         }
@@ -668,18 +846,21 @@ fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
             .take(usize::from(panes[1].height.saturating_sub(2)))
             .map(|(source, line)| {
                 let prefix = if view.full {
-                    Span::styled(format!("{:>5} ", source + 1), Style::default().fg(MUTED))
+                    Span::styled(
+                        format!("{:>5} ", source + 1),
+                        Style::default().fg(theme.muted),
+                    )
                 } else {
                     Span::raw("")
                 };
                 let style = if view.full {
                     Style::default()
                 } else {
-                    patch_style(line)
+                    patch_style(theme, line)
                 };
                 presentation_line(
                     prefix,
-                    highlighted(line, source, 0, search, style),
+                    highlighted(theme, line, source, 0, search, style),
                     view.horizontal,
                     panes[1].width.saturating_sub(2),
                 )
@@ -698,7 +879,7 @@ fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
             " Full file · committed version "
         };
         frame.render_widget(
-            Paragraph::new(lines).block(panel(title.into(), view.focus == Focus::Preview)),
+            Paragraph::new(lines).block(panel(theme, title.into(), view.focus == Focus::Preview)),
             panes[1],
         );
     }
@@ -737,32 +918,33 @@ fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
     frame.render_widget(Paragraph::new(footer), rows[2]);
 }
 
-fn patch_style(line: &str) -> Style {
+fn patch_style(theme: &Theme, line: &str) -> Style {
     Style::default().fg(if line.starts_with("+++") || line.starts_with("---") {
-        ACCENT
+        theme.muted
     } else if line.starts_with('+') {
-        Color::Green
+        theme.added
     } else if line.starts_with('-') {
-        Color::Red
+        theme.deleted
     } else if line.starts_with("@@") {
-        Color::Magenta
+        theme.hunk
     } else {
-        Color::Reset
+        theme.text
     })
 }
 
-fn match_style(active: bool) -> Style {
+fn match_style(theme: &Theme, active: bool) -> Style {
     Style::default()
-        .fg(Color::Black)
+        .fg(theme.search_text)
         .bg(if active {
-            Color::LightMagenta
+            theme.search_active
         } else {
-            Color::Yellow
+            theme.search
         })
         .bold()
 }
 
 fn highlighted(
+    theme: &Theme,
     text: &str,
     source: usize,
     prefix: usize,
@@ -791,7 +973,7 @@ fn highlighted(
             matched.line == source && matched.bytes.start < end && matched.bytes.end > offset
         });
         let style = if matching {
-            base.patch(match_style(active))
+            base.patch(match_style(theme, active))
         } else {
             base
         };
@@ -809,6 +991,7 @@ fn highlighted(
 }
 
 fn split_line(
+    theme: &Theme,
     cell: Option<&DiffCell>,
     search: &Search,
     horizontal: usize,
@@ -818,11 +1001,11 @@ fn split_line(
         return Line::raw("");
     };
     let color = match cell.kind {
-        CellKind::Delete => Color::Red,
-        CellKind::Insert => Color::Green,
-        CellKind::Hunk => Color::Magenta,
-        CellKind::Meta => MUTED,
-        CellKind::Context => Color::Reset,
+        CellKind::Delete => theme.deleted,
+        CellKind::Insert => theme.added,
+        CellKind::Hunk => theme.hunk,
+        CellKind::Meta => theme.muted,
+        CellKind::Context => theme.text,
     };
     let base = Style::default().fg(color);
     let sign = match cell.kind {
@@ -834,8 +1017,8 @@ fn split_line(
         .on_line(cell.source)
         .iter()
         .find(|matched| cell.prefix > 0 && matched.bytes.start < cell.prefix)
-        .map(|matched| match_style(search.current() == Some(matched)))
-        .unwrap_or(Style::default().fg(MUTED));
+        .map(|matched| match_style(theme, search.current() == Some(matched)))
+        .unwrap_or(Style::default().fg(theme.muted));
     let prefix = Span::styled(
         format!(
             "{:>5} {sign} ",
@@ -845,15 +1028,16 @@ fn split_line(
         ),
         prefix_style,
     );
-    let mut spans = highlighted(&cell.text, cell.source, cell.prefix, search, base);
+    let mut spans = highlighted(theme, &cell.text, cell.source, cell.prefix, search, base);
     if let Some((source, annotation)) = &cell.annotation {
         spans.push(Span::raw("  "));
         spans.extend(highlighted(
+            theme,
             annotation,
             *source,
             0,
             search,
-            Style::default().fg(MUTED),
+            Style::default().fg(theme.muted),
         ));
     }
     presentation_line(prefix, spans, horizontal, width)
@@ -894,7 +1078,7 @@ fn presentation_line(
     Line::from(visible)
 }
 
-fn draw_hunks(frame: &mut Frame, hunks: &Hunks, area: Rect) {
+fn draw_hunks(theme: &Theme, frame: &mut Frame, hunks: &Hunks, area: Rect) {
     let rows = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
@@ -913,15 +1097,16 @@ fn draw_hunks(frame: &mut Frame, hunks: &Hunks, area: Rect) {
             hunks.selected + 1,
             hunks.bodies.len()
         ))
-        .style(Style::default().fg(ACCENT)),
+        .style(Style::default().fg(theme.muted)),
         rows[0],
     );
     frame.render_widget(
-        Paragraph::new(diff_text(&String::from_utf8_lossy(
-            &hunks.bodies[hunks.selected],
-        )))
+        Paragraph::new(diff_text(
+            theme,
+            &String::from_utf8_lossy(&hunks.bodies[hunks.selected]),
+        ))
         .scroll((hunks.scroll, hunks.horizontal))
-        .block(panel(" Selected hunk ".into(), true)),
+        .block(panel(theme, " Selected hunk ".into(), true)),
         rows[1],
     );
     frame.render_widget(
@@ -932,7 +1117,7 @@ fn draw_hunks(frame: &mut Frame, hunks: &Hunks, area: Rect) {
     );
 }
 
-fn draw_rebase(frame: &mut Frame, plan: &Plan, area: Rect) {
+fn draw_rebase(theme: &Theme, frame: &mut Frame, plan: &Plan, area: Rect) {
     let rows = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
@@ -951,9 +1136,9 @@ fn draw_rebase(frame: &mut Frame, plan: &Plan, area: Rect) {
             }
         ))
         .style(Style::default().fg(if plan.published {
-            Color::Yellow
+            theme.warning
         } else {
-            ACCENT
+            theme.muted
         })),
         rows[0],
     );
@@ -962,9 +1147,9 @@ fn draw_rebase(frame: &mut Frame, plan: &Plan, area: Rect) {
         .iter()
         .map(|step| {
             let color = match step.action {
-                RebaseAction::Drop => Color::Red,
-                RebaseAction::Pick => Color::Reset,
-                _ => Color::Yellow,
+                RebaseAction::Drop => theme.deleted,
+                RebaseAction::Pick => theme.text,
+                _ => theme.warning,
             };
             ListItem::new(format!(
                 "{:<7} {} {}",
@@ -983,8 +1168,9 @@ fn draw_rebase(frame: &mut Frame, plan: &Plan, area: Rect) {
     frame.render_stateful_widget(
         List::new(items)
             .highlight_symbol("› ")
-            .highlight_style(Style::default().bg(Color::DarkGray).bold())
+            .highlight_style(Style::default().bg(theme.selection).bold())
             .block(panel(
+                theme,
                 " Interactive rebase sequence · no changes until confirmed ".into(),
                 true,
             )),
@@ -994,7 +1180,7 @@ fn draw_rebase(frame: &mut Frame, plan: &Plan, area: Rect) {
     frame.render_widget(Paragraph::new("j/k select · J/K reorder · p pick · r reword · s squash · f fixup · d drop · e edit\nEnter review / start · Esc cancel · edit pauses for amend, then C continue"), rows[2]);
 }
 
-fn word_diff(left: &str, right: &str, current: bool) -> Text<'static> {
+fn word_diff(theme: &Theme, left: &str, right: &str, current: bool) -> Text<'static> {
     let diff = TextDiff::configure()
         .timeout(std::time::Duration::from_millis(30))
         .diff_words(left, right);
@@ -1009,11 +1195,7 @@ fn word_diff(left: &str, right: &str, current: bool) -> Text<'static> {
             Style::default()
         } else {
             Style::default()
-                .fg(if current {
-                    Color::LightRed
-                } else {
-                    Color::LightGreen
-                })
+                .fg(if current { theme.deleted } else { theme.added })
                 .add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
         };
         for part in change.value().split_inclusive('\n') {
@@ -1034,23 +1216,23 @@ fn word_diff(left: &str, right: &str, current: bool) -> Text<'static> {
     Text::from(lines)
 }
 
-fn diff_text(text: &str) -> Text<'static> {
+fn diff_text(theme: &Theme, text: &str) -> Text<'static> {
     Text::from(
         text.lines()
             .map(|line| {
                 let color = if line.starts_with("+++") || line.starts_with("---") {
-                    ACCENT
+                    theme.muted
                 } else if line.starts_with('+') {
-                    Color::Green
+                    theme.added
                 } else if line.starts_with('-')
                     || line.starts_with("<<<<<<<")
                     || line.starts_with(">>>>>>>")
                 {
-                    Color::Red
+                    theme.deleted
                 } else if line.starts_with("@@") {
-                    Color::Magenta
+                    theme.hunk
                 } else {
-                    Color::Reset
+                    theme.text
                 };
                 Line::styled(safe_text(line), Style::default().fg(color))
             })
@@ -1058,8 +1240,9 @@ fn diff_text(text: &str) -> Text<'static> {
     )
 }
 
-fn diff_window(text: &str, start: usize, height: u16) -> Text<'static> {
+fn diff_window(theme: &Theme, text: &str, start: usize, height: u16) -> Text<'static> {
     diff_text(
+        theme,
         &text
             .lines()
             .skip(start)
@@ -1083,10 +1266,10 @@ fn split(area: Rect, left: u16) -> std::rc::Rc<[Rect]> {
         .split(area)
 }
 
-fn panel(title: String, focused: bool) -> Block<'static> {
+fn panel(theme: &Theme, title: String, focused: bool) -> Block<'static> {
     Block::bordered()
         .title(title)
-        .border_style(Style::default().fg(if focused { ACCENT } else { MUTED }))
+        .border_style(Style::default().fg(if focused { theme.accent } else { theme.border }))
 }
 
 pub fn safe_text(text: &str) -> String {
@@ -1119,12 +1302,13 @@ mod tests {
             ..Search::default()
         };
         search.reindex(&document, 0);
-        let spans = highlighted(text, 0, 0, &search, Style::default());
+        let theme = Theme::default();
+        let spans = highlighted(&theme, text, 0, 0, &search, Style::default());
         assert!(
             spans
                 .iter()
                 .any(|span| span.content.contains("👩\u{200d}💻")
-                    && span.style.bg == Some(Color::LightMagenta))
+                    && span.style.bg == Some(theme.search_active))
         );
         assert_eq!(
             spans
@@ -1138,7 +1322,7 @@ mod tests {
         search.reindex(&Document::full(&text), 0);
         let line = presentation_line(
             Span::raw(" 1234 "),
-            highlighted(&text, 0, 0, &search, Style::default()),
+            highlighted(&theme, &text, 0, 0, &search, Style::default()),
             100_000,
             32,
         );
@@ -1194,5 +1378,108 @@ mod tests {
             "hello\\u{1b}[31m\\nfile"
         );
         assert!(safe_text("\u{202e}").starts_with('\\'));
+    }
+
+    #[test]
+    fn all_presets_render_their_background_and_semantic_diff_colors() {
+        let dir = tempfile::tempdir().unwrap();
+        Repo {
+            root: dir.path().into(),
+        }
+        .bytes(&["init", "-b", "main"])
+        .unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
+        app.preview = "--- old\n+++ new\n@@ hunk @@\n-deleted\n+added".into();
+        for name in crate::theme::PRESETS {
+            app.theme = Theme::preset(name).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .any(|cell| cell.bg == app.theme.background)
+            );
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .any(|cell| cell.fg == app.theme.added && cell.symbol() == "+")
+            );
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .any(|cell| cell.fg == app.theme.deleted && cell.symbol() == "-")
+            );
+            if *name != "terminal" {
+                assert!(buffer.content().iter().all(|cell| !matches!(
+                    cell.fg,
+                    ratatui::style::Color::Green
+                        | ratatui::style::Color::Red
+                        | ratatui::style::Color::Cyan
+                        | ratatui::style::Color::Magenta
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn explorer_filenames_distinguish_staged_unstaged_and_conflicts_in_every_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        Repo {
+            root: dir.path().into(),
+        }
+        .bytes(&["init", "-b", "main"])
+        .unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
+        app.snapshot.files = [
+            ("staged.txt", "M "),
+            ("unstaged.txt", " M"),
+            ("partial.txt", "MM"),
+            ("conflict.txt", "UU"),
+        ]
+        .map(|(path, status)| crate::git::FileChange {
+            path: path.into(),
+            status: status.into(),
+            original: None,
+        })
+        .to_vec();
+        app.explorer = crate::tree::explorer(&app.snapshot.files, &app.repo.root);
+        app.explorer.select_file(0);
+        app.selected = 0;
+        for preset in crate::theme::PRESETS {
+            app.theme = Theme::preset(preset).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            for (name, color) in [
+                ("staged.txt", app.theme.added),
+                ("unstaged.txt", app.theme.text),
+                ("partial.txt", app.theme.added),
+                ("conflict.txt", app.theme.deleted),
+            ] {
+                let symbols = name
+                    .chars()
+                    .map(|character| character.to_string())
+                    .collect::<Vec<_>>();
+                let cells = buffer
+                    .content()
+                    .chunks(140)
+                    .flat_map(|row| row[..44].windows(symbols.len()))
+                    .find(|cells| {
+                        cells
+                            .iter()
+                            .zip(&symbols)
+                            .all(|(cell, symbol)| cell.symbol() == symbol)
+                    })
+                    .unwrap();
+                assert!(
+                    cells.iter().all(|cell| cell.fg == color),
+                    "{preset}: {name}"
+                );
+            }
+        }
     }
 }
