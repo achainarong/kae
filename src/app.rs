@@ -7,7 +7,7 @@ use std::{
         mpsc::{self, Receiver, TryRecvError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -17,7 +17,8 @@ use ratatui::DefaultTerminal;
 use crate::{
     conflict::{Choice, Conflict},
     editor,
-    git::{Action, GitOutput, Hunks, Repo, Snapshot},
+    git::{Action, CommitFiles, GitOutput, Hunks, Repo, Snapshot},
+    loader::{Loader, Preview, ReadData, ReadKind, Request},
     rebase::{Plan, RebaseAction},
     ui,
 };
@@ -116,6 +117,22 @@ pub enum CommandId {
 }
 
 impl CommandId {
+    fn needs_confirmation(self) -> bool {
+        use CommandId::*;
+        // Exhaustive on purpose: a new command must make an explicit safety decision.
+        match self {
+            Unstage | UnstageAll | Amend | Discard | TakeCurrent | TakeIncoming
+            | DeleteConflict | BranchRename | BranchDelete | Merge | CherryPick | Revert
+            | Fetch | PullFF | PullMerge | PullRebase | Push | PushUpstream | StashSave
+            | StashApply | StashPop | StashDrop | TagDelete | WorktreeRemove | Continue | Skip
+            | Abort => true,
+            // Hunk application, rebase execution, saves, and staged-version
+            // replacement have their own contextual confirmation steps.
+            Stage | StageAll | Hunks | Commit | Edit | Resolve | BranchCreate | BranchSwitch
+            | Compare | MergePreview | Rebase | TagCreate | WorktreeAdd | WorktreeOpen | Review
+            | Log => false,
+        }
+    }
     pub const ALL: [Self; 42] = [
         Self::Stage,
         Self::Unstage,
@@ -257,6 +274,17 @@ pub enum Task {
     Hunk(Hunks),
     Rebase(Plan),
     Preview(Action),
+    SaveConflict(Box<Conflict>),
+}
+
+pub struct CommitView {
+    pub commit: CommitFiles,
+    pub selected: usize,
+    pub focus: Focus,
+    pub full: bool,
+    pub preview: String,
+    pub scroll: usize,
+    pub horizontal: u16,
 }
 
 pub enum PromptKind {
@@ -265,6 +293,7 @@ pub enum PromptKind {
 }
 
 pub enum Modal {
+    Loading(String),
     Help {
         scroll: u16,
     },
@@ -288,6 +317,11 @@ pub enum Modal {
         horizontal: u16,
     },
     Conflict(Box<Conflict>),
+    Inline {
+        conflict: Box<Conflict>,
+        editor: Box<editor::ResultEditor>,
+    },
+    Commit(Box<CommitView>),
     Hunks(Box<Hunks>),
     Rebase(Box<Plan>),
 }
@@ -297,6 +331,7 @@ struct WorkerResult {
     output: std::result::Result<GitOutput, String>,
     snapshot: std::result::Result<Snapshot, String>,
     preview: bool,
+    conflict: Option<Box<Conflict>>,
 }
 
 pub struct App {
@@ -314,6 +349,17 @@ pub struct App {
     pub busy: Option<String>,
     pub quit_requested: bool,
     pub last_output: String,
+    pub loaded: bool,
+    pub preview_loading: bool,
+    pub confirm_scroll: u16,
+    loader: Loader,
+    next_read: u64,
+    snapshot_read: Option<u64>,
+    preview_read: Option<u64>,
+    detail_read: Option<u64>,
+    commit_read: Option<u64>,
+    deferred_snapshot: Option<Box<(Repo, Snapshot)>>,
+    last_refresh: Instant,
     worker: Option<Receiver<WorkerResult>>,
     edit_path: Option<PathBuf>,
     quit: bool,
@@ -321,8 +367,10 @@ pub struct App {
 
 impl App {
     pub fn new(path: &Path) -> Result<Self> {
-        let repo = Repo::discover(path)?;
-        let snapshot = repo.snapshot()?;
+        let repo = Repo {
+            root: std::env::current_dir()?.join(path),
+        };
+        let snapshot = Snapshot::loading();
         let mut app = Self {
             repo,
             snapshot,
@@ -338,15 +386,49 @@ impl App {
             busy: None,
             quit_requested: false,
             last_output: "No operations yet.".into(),
+            loaded: false,
+            preview_loading: false,
+            confirm_scroll: 0,
+            loader: Loader::new(),
+            next_read: 0,
+            snapshot_read: None,
+            preview_read: None,
+            detail_read: None,
+            commit_read: None,
+            deferred_snapshot: None,
+            last_refresh: Instant::now(),
             worker: None,
             edit_path: None,
             quit: false,
         };
-        app.load_preview();
+        app.preview = "Loading repository… Navigation and quit remain available.".into();
+        app.refresh();
+        Ok(app)
+    }
+
+    #[cfg(test)]
+    pub fn ready(path: &Path) -> Result<Self> {
+        let mut app = Self::new(path)?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while (!app.loaded || app.preview_loading) && Instant::now() < deadline {
+            app.poll_loading();
+            if app.snapshot_read.is_none() && !app.loaded {
+                anyhow::bail!(
+                    "{}",
+                    app.error.as_deref().unwrap_or("Failed to load repository")
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        ensure!(
+            app.loaded && !app.preview_loading,
+            "Repository loading timed out"
+        );
         Ok(app)
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let paste = editor::PasteMode::enable()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         for signal in [
             signal_hook::consts::SIGINT,
@@ -358,6 +440,8 @@ impl App {
         let mut redraw = true;
         while !self.quit {
             redraw |= self.poll_worker();
+            redraw |= self.poll_loading();
+            self.auto_refresh(Instant::now());
             if shutdown.load(Ordering::Relaxed) && !self.quit_requested {
                 self.quit_requested = true;
                 redraw = true;
@@ -367,9 +451,11 @@ impl App {
                 continue;
             }
             if let Some(path) = self.edit_path.take() {
+                paste.suspend()?;
                 ratatui::restore();
                 let result = editor::open(&path);
                 *terminal = ratatui::init();
+                paste.resume()?;
                 terminal.clear()?;
                 if let Err(error) = result {
                     self.fail(error);
@@ -397,6 +483,13 @@ impl App {
                             );
                         } else {
                             self.handle_key(key);
+                        }
+                    }
+                    Event::Paste(text) => {
+                        let size = terminal.size()?;
+                        let (width, height) = ui::minimum_size(self);
+                        if size.width >= width && size.height >= height {
+                            self.handle_paste(&text);
                         }
                     }
                     Event::Mouse(mouse) if self.modal.is_none() && self.busy.is_none() => {
@@ -499,7 +592,10 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.busy.is_some() {
                 self.quit_requested = true;
-            } else if matches!(&self.modal, Some(Modal::Conflict(conflict)) if conflict.dirty()) {
+            } else if matches!(&self.modal, Some(Modal::Conflict(conflict)) if conflict.dirty())
+                || matches!(&self.modal, Some(Modal::Inline { conflict, editor }) if conflict.dirty() || editor.text() != conflict.result())
+                || matches!(&self.modal, Some(Modal::Confirm { task: Task::SaveConflict(conflict), .. }) if conflict.dirty())
+            {
                 self.error = Some(
                     "Unsaved conflict choices. Save, or q then y to discard the draft.".into(),
                 );
@@ -598,6 +694,17 @@ impl App {
             KeyCode::Char('A') => self.invoke(CommandId::Abort),
             KeyCode::Char('~') => self.invoke(CommandId::Log),
             KeyCode::Enter => match self.workspace {
+                Workspace::History => {
+                    if let Some(commit) = self.snapshot.commits.get(self.selected) {
+                        self.detail(
+                            ReadKind::Commit {
+                                oid: commit.oid.clone(),
+                                parent: 0,
+                            },
+                            "Loading commit files…",
+                        );
+                    }
+                }
                 Workspace::Files
                     if self
                         .snapshot
@@ -618,6 +725,14 @@ impl App {
     fn handle_modal(&mut self, modal: Modal, key: KeyEvent) {
         let closing = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
         match modal {
+            Modal::Loading(label) => {
+                if closing {
+                    self.detail_read = None;
+                    self.request_preview(false);
+                } else {
+                    self.modal = Some(Modal::Loading(label));
+                }
+            }
             Modal::Help { mut scroll } => {
                 if closing || key.code == KeyCode::Char('?') {
                     return;
@@ -711,13 +826,40 @@ impl App {
                 });
             }
             Modal::Confirm { task, detail } => match key.code {
-                KeyCode::Char('y') => self.start(task),
+                KeyCode::Char('y') => {
+                    self.confirm_scroll = 0;
+                    self.start(task);
+                }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
-                    if let Task::Rebase(plan) = task {
-                        self.modal = Some(Modal::Rebase(Box::new(plan)));
+                    self.confirm_scroll = 0;
+                    match task {
+                        Task::Rebase(plan) => self.modal = Some(Modal::Rebase(Box::new(plan))),
+                        Task::SaveConflict(conflict) => {
+                            self.modal = Some(Modal::Conflict(conflict))
+                        }
+                        Task::Hunk(hunks) => self.modal = Some(Modal::Hunks(Box::new(hunks))),
+                        _ => {}
                     }
                 }
-                _ => self.modal = Some(Modal::Confirm { task, detail }),
+                _ => {
+                    match key.code {
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.confirm_scroll = self.confirm_scroll.saturating_add(1)
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.confirm_scroll = self.confirm_scroll.saturating_sub(1)
+                        }
+                        KeyCode::PageDown => {
+                            self.confirm_scroll = self.confirm_scroll.saturating_add(8)
+                        }
+                        KeyCode::PageUp => {
+                            self.confirm_scroll = self.confirm_scroll.saturating_sub(8)
+                        }
+                        KeyCode::Home => self.confirm_scroll = 0,
+                        _ => {}
+                    }
+                    self.modal = Some(Modal::Confirm { task, detail });
+                }
             },
             Modal::Output {
                 title,
@@ -782,11 +924,12 @@ impl App {
                         KeyCode::Char('4') => conflict.choose(Choice::IncomingThenCurrent),
                         KeyCode::Char('u') => conflict.undo(),
                         KeyCode::Char('n') | KeyCode::Char(']') => {
-                            conflict.selected = (conflict.selected + 1) % count;
+                            conflict.selected = (conflict.selected + 1) % count.max(1);
                             conflict.scroll = 0;
                         }
                         KeyCode::Char('p') | KeyCode::Char('[') => {
-                            conflict.selected = (conflict.selected + count - 1) % count;
+                            conflict.selected =
+                                (conflict.selected + count.max(1) - 1) % count.max(1);
                             conflict.scroll = 0;
                         }
                         KeyCode::Char('b') => conflict.show_base = !conflict.show_base,
@@ -802,12 +945,10 @@ impl App {
                         KeyCode::Char('l') | KeyCode::Right => {
                             conflict.horizontal = conflict.horizontal.saturating_add(4)
                         }
-                        KeyCode::Char('s') => match conflict.save(&self.repo) {
-                            Ok(()) => {
-                                self.notice = "Resolution saved to working tree — not staged. Press a to stage when complete.".into();
-                            }
-                            Err(error) => self.fail(error),
-                        },
+                        KeyCode::Char('s') => {
+                            self.confirm_save(conflict);
+                            return;
+                        }
                         KeyCode::Char('a') => {
                             if conflict.dirty() || conflict.unresolved() > 0 {
                                 self.error = Some(
@@ -832,6 +973,21 @@ impl App {
                             }
                         }
                         KeyCode::Char('e') => {
+                            match editor::ResultEditor::new(&conflict.result()) {
+                                Ok(editor) => {
+                                    self.modal = Some(Modal::Inline {
+                                        conflict,
+                                        editor: Box::new(editor),
+                                    })
+                                }
+                                Err(error) => {
+                                    self.fail(error);
+                                    self.modal = Some(Modal::Conflict(conflict));
+                                }
+                            }
+                            return;
+                        }
+                        KeyCode::Char('E') => {
                             if conflict.dirty() {
                                 self.error = Some(
                                     "Save your choices before opening the external editor.".into(),
@@ -848,6 +1004,128 @@ impl App {
                     }
                 }
                 self.modal = Some(Modal::Conflict(conflict));
+            }
+            Modal::Inline {
+                mut conflict,
+                mut editor,
+            } => {
+                let save =
+                    key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL);
+                if key.code == KeyCode::Esc || save {
+                    match conflict.edit_result(editor.text()) {
+                        Ok(()) if save => self.confirm_save(conflict),
+                        Ok(()) => self.modal = Some(Modal::Conflict(conflict)),
+                        Err(error) => {
+                            self.fail(error);
+                            self.modal = Some(Modal::Inline { conflict, editor });
+                        }
+                    }
+                    return;
+                }
+                if let KeyCode::Char(character) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && (!editor::safe_editor_text(&character.to_string())
+                        || editor.text().len() + character.len_utf8() > crate::git::PREVIEW_LIMIT)
+                {
+                    self.error = Some("Unsupported character or inline size limit reached.".into());
+                } else if editor.area.input(key) && editor.text().len() > crate::git::PREVIEW_LIMIT
+                {
+                    editor.area.undo();
+                    self.error = Some("Result exceeds the 256 KiB inline editing limit.".into());
+                }
+                self.modal = Some(Modal::Inline { conflict, editor });
+            }
+            Modal::Commit(mut view) => {
+                if closing {
+                    self.commit_read = None;
+                    self.request_preview(false);
+                    return;
+                }
+                let mut reload = false;
+                match key.code {
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        view.focus = if view.focus == Focus::List {
+                            Focus::Preview
+                        } else {
+                            Focus::List
+                        }
+                    }
+                    KeyCode::Enter => view.focus = Focus::Preview,
+                    KeyCode::Down | KeyCode::Char('j') if view.focus == Focus::List => {
+                        view.selected =
+                            (view.selected + 1).min(view.commit.files.len().saturating_sub(1));
+                        reload = true;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if view.focus == Focus::List => {
+                        view.selected = view.selected.saturating_sub(1);
+                        reload = true;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        view.scroll = view
+                            .scroll
+                            .saturating_add(1)
+                            .min(view.preview.lines().count().saturating_sub(1))
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
+                    KeyCode::PageDown => {
+                        view.scroll = view
+                            .scroll
+                            .saturating_add(12)
+                            .min(view.preview.lines().count().saturating_sub(1))
+                    }
+                    KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(12),
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        view.horizontal = view.horizontal.saturating_add(4)
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        view.horizontal = view.horizontal.saturating_sub(4)
+                    }
+                    KeyCode::Home => {
+                        view.scroll = 0;
+                        view.horizontal = 0;
+                    }
+                    KeyCode::End => view.scroll = view.preview.lines().count().saturating_sub(1),
+                    KeyCode::Char('t') => {
+                        view.full = !view.full;
+                        reload = true;
+                    }
+                    KeyCode::Char('n') if !view.full => {
+                        if let Some(line) =
+                            view.preview.lines().enumerate().find(|(index, line)| {
+                                *index > view.scroll && line.starts_with("@@")
+                            })
+                        {
+                            view.scroll = line.0;
+                        }
+                    }
+                    KeyCode::Char('p') if !view.full => {
+                        if let Some(line) = view
+                            .preview
+                            .lines()
+                            .enumerate()
+                            .filter(|(index, line)| *index < view.scroll && line.starts_with("@@"))
+                            .last()
+                        {
+                            view.scroll = line.0;
+                        }
+                    }
+                    KeyCode::Char('P') if view.commit.parents.len() > 1 => {
+                        self.commit_read = None;
+                        self.detail(
+                            ReadKind::Commit {
+                                oid: view.commit.oid.clone(),
+                                parent: (view.commit.parent + 1) % view.commit.parents.len(),
+                            },
+                            "Loading other parent…",
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::Commit(view));
+                if reload {
+                    self.load_commit_preview();
+                }
             }
             Modal::Hunks(mut hunks) => {
                 if closing {
@@ -875,15 +1153,27 @@ impl App {
                         hunks.horizontal = hunks.horizontal.saturating_add(4)
                     }
                     KeyCode::Char('s') => {
-                        self.start(Task::Hunk(*hunks));
+                        self.modal = Some(Modal::Confirm {
+                            detail: format!(
+                                "{} selected hunk in {:?}?\nThe index is updated; working files are not changed.",
+                                if hunks.cached { "Unstage" } else { "Stage" },
+                                hunks.path
+                            ),
+                            task: Task::Hunk(*hunks),
+                        });
                         return;
                     }
                     KeyCode::Tab => {
                         if let Some(file) = self.snapshot.files.get(self.selected) {
-                            match Hunks::load(&self.repo, &self.snapshot, file, !hunks.cached) {
-                                Ok(other) => hunks = Box::new(other),
-                                Err(error) => self.fail(error),
-                            }
+                            self.detail(
+                                ReadKind::Hunks {
+                                    snapshot: Box::new(self.snapshot.clone()),
+                                    file: file.clone(),
+                                    cached: !hunks.cached,
+                                },
+                                "Loading hunks…",
+                            );
+                            return;
                         }
                     }
                     _ => {}
@@ -979,24 +1269,141 @@ impl App {
     }
 
     fn load_preview(&mut self) {
-        self.scroll = 0;
-        self.horizontal = 0;
-        self.preview = self
-            .preview_text()
-            .unwrap_or_else(|error| format!("Could not load preview:\n{error:#}"));
+        self.request_preview(true);
     }
 
-    fn preview_text(&self) -> Result<String> {
-        let empty = || "Nothing here yet. Use : to find available commands.".to_owned();
-        Ok(match self.workspace {
-            Workspace::Files => match self.snapshot.files.get(self.selected) { Some(file) => self.repo.file_preview(file)?, None => "Working tree is clean.\n\nPress 2 for history, b to create a branch, or : for commands.".into() },
-            Workspace::History => match self.snapshot.commits.get(self.selected) { Some(commit) => format!("{} · {}\n\n{}", commit.author, commit.age, self.repo.show(&commit.oid)?), None => "No commits yet. Stage files and press c to create the first commit.".into() },
-            Workspace::Branches => match self.snapshot.branches.get(self.selected) { Some(branch) => format!("Branch: {}\nUpstream: {} {}\n\n{}", branch.name, branch.upstream, branch.tracking, self.repo.show(&branch.oid)?), None => empty() },
-            Workspace::Remotes => match self.snapshot.remotes.get(self.selected) { Some(remote) => format!("Remote: {remote}\nCurrent branch: {}\n\n{}\n\nf fetch · p pull fast-forward only · P push\n: for pull merge / rebase and upstream setup.\n\nNetwork authentication must already be configured.\nRemote URLs are omitted to avoid exposing credentials.", self.snapshot.branch, self.repo.text(&["status", "--short", "--branch"])?), None => "No remotes configured.\n\nAdd one using git remote add, then press r.\nRemote configuration editing is not part of this MVP.".into() },
-            Workspace::Stashes => match self.snapshot.stashes.get(self.selected) { Some(stash) => self.repo.show(&stash.oid)?, None => empty() },
-            Workspace::Tags => match self.snapshot.tags.get(self.selected) { Some(tag) => self.repo.show(&format!("refs/tags/{tag}"))?, None => empty() },
-            Workspace::Worktrees => match self.snapshot.worktrees.get(self.selected) { Some(worktree) => format!("{}\nBranch: {}\nLocked: {}\n\nEnter to open.\n: to add a detached worktree or remove a clean one.\n\n{}", worktree.path.display(), worktree.branch, worktree.locked, Repo { root: worktree.path.clone() }.text(&["status", "--short", "--branch"] ).unwrap_or_else(|error| error.to_string())), None => empty() },
-        })
+    fn preview_target(&self) -> Preview {
+        let empty = || Preview::Empty("Nothing here yet. Use : for commands.".into());
+        match self.workspace {
+            Workspace::Files => self
+                .snapshot
+                .files
+                .get(self.selected)
+                .cloned()
+                .map(Preview::File)
+                .unwrap_or_else(|| {
+                    Preview::Empty(
+                        "Working tree is clean.\n\nPress 2 for history or : for commands.".into(),
+                    )
+                }),
+            Workspace::History => self
+                .snapshot
+                .commits
+                .get(self.selected)
+                .map(|commit| Preview::Revision {
+                    revision: commit.oid.clone(),
+                    heading: format!(
+                        "{} · {}\nEnter to browse changed files",
+                        commit.author, commit.age
+                    ),
+                })
+                .unwrap_or_else(empty),
+            Workspace::Branches => self
+                .snapshot
+                .branches
+                .get(self.selected)
+                .map(|branch| Preview::Revision {
+                    revision: branch.oid.clone(),
+                    heading: format!(
+                        "Branch: {}\nUpstream: {} {}",
+                        branch.name, branch.upstream, branch.tracking
+                    ),
+                })
+                .unwrap_or_else(empty),
+            Workspace::Remotes => self
+                .snapshot
+                .remotes
+                .get(self.selected)
+                .map(|remote| Preview::Remote {
+                    name: remote.clone(),
+                    branch: self.snapshot.branch.clone(),
+                })
+                .unwrap_or_else(|| {
+                    Preview::Empty(
+                        "No remotes configured. Add one with git remote add, then refresh.".into(),
+                    )
+                }),
+            Workspace::Stashes => self
+                .snapshot
+                .stashes
+                .get(self.selected)
+                .map(|stash| Preview::Revision {
+                    revision: stash.oid.clone(),
+                    heading: stash.subject.clone(),
+                })
+                .unwrap_or_else(empty),
+            Workspace::Tags => self
+                .snapshot
+                .tags
+                .get(self.selected)
+                .map(|tag| Preview::Revision {
+                    revision: format!("refs/tags/{tag}"),
+                    heading: tag.clone(),
+                })
+                .unwrap_or_else(empty),
+            Workspace::Worktrees => self
+                .snapshot
+                .worktrees
+                .get(self.selected)
+                .cloned()
+                .map(Preview::Worktree)
+                .unwrap_or_else(empty),
+        }
+    }
+
+    fn selected_key(&self) -> Option<OsString> {
+        match self.workspace {
+            Workspace::Files => self
+                .snapshot
+                .files
+                .get(self.selected)
+                .map(|file| file.path.as_os_str().to_owned()),
+            Workspace::History => self
+                .snapshot
+                .commits
+                .get(self.selected)
+                .map(|commit| commit.oid.clone().into()),
+            Workspace::Branches => self
+                .snapshot
+                .branches
+                .get(self.selected)
+                .map(|branch| branch.name.clone().into()),
+            Workspace::Remotes => self
+                .snapshot
+                .remotes
+                .get(self.selected)
+                .cloned()
+                .map(Into::into),
+            Workspace::Stashes => self
+                .snapshot
+                .stashes
+                .get(self.selected)
+                .map(|stash| stash.oid.clone().into()),
+            Workspace::Tags => self
+                .snapshot
+                .tags
+                .get(self.selected)
+                .cloned()
+                .map(Into::into),
+            Workspace::Worktrees => self
+                .snapshot
+                .worktrees
+                .get(self.selected)
+                .map(|tree| tree.path.as_os_str().to_owned()),
+        }
+    }
+
+    fn request_preview(&mut self, reset: bool) {
+        if !self.loaded || self.busy.is_some() {
+            return;
+        }
+        if reset {
+            self.scroll = 0;
+            self.horizontal = 0;
+            self.preview = "Loading preview…".into();
+        }
+        self.preview_loading = true;
+        self.preview_read = Some(self.read(ReadKind::Preview(self.preview_target())));
     }
 
     fn revision(&self) -> Result<String> {
@@ -1052,6 +1459,10 @@ impl App {
 
     fn invoke(&mut self, command: CommandId) {
         self.error = None;
+        if !self.loaded {
+            self.error = Some("Wait for repository loading to finish.".into());
+            return;
+        }
         if !command.available(self) {
             self.error = Some("Select an appropriate item in its workspace first.".into());
             return;
@@ -1094,12 +1505,14 @@ impl App {
                     .files
                     .get(self.selected)
                     .context("Select a file")?;
-                self.modal = Some(Modal::Conflict(Box::new(Conflict::load(
-                    &self.repo,
-                    file.path.clone(),
-                    self.snapshot.guard.clone(),
-                    &self.snapshot.branch,
-                )?)));
+                self.detail(
+                    ReadKind::Conflict {
+                        path: file.path.clone(),
+                        guard: self.snapshot.guard.clone(),
+                        branch: self.snapshot.branch.clone(),
+                    },
+                    "Loading conflict…",
+                );
                 return Ok(());
             }
             Hunks => {
@@ -1109,20 +1522,24 @@ impl App {
                     .get(self.selected)
                     .context("Select a file")?;
                 let cached = file.status.as_bytes()[1] == b' ';
-                self.modal = Some(Modal::Hunks(Box::new(crate::git::Hunks::load(
-                    &self.repo,
-                    &self.snapshot,
-                    file,
-                    cached,
-                )?)));
+                self.detail(
+                    ReadKind::Hunks {
+                        snapshot: Box::new(self.snapshot.clone()),
+                        file: file.clone(),
+                        cached,
+                    },
+                    "Loading hunks…",
+                );
                 return Ok(());
             }
             Rebase => {
-                self.modal = Some(Modal::Rebase(Box::new(Plan::load(
-                    &self.repo,
-                    &self.snapshot,
-                    &self.revision()?,
-                )?)));
+                self.detail(
+                    ReadKind::Rebase {
+                        snapshot: Box::new(self.snapshot.clone()),
+                        base: self.revision()?,
+                    },
+                    "Loading rebase plan…",
+                );
                 return Ok(());
             }
             WorktreeOpen => {
@@ -1138,34 +1555,13 @@ impl App {
             }
             Compare => {
                 let revision = self.revision()?;
-                self.output(
-                    "Selected revision → HEAD",
-                    self.repo.text(&[
-                        "diff",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        &revision,
-                        "HEAD",
-                        "--",
-                    ])?,
-                );
+                self.detail(ReadKind::Compare(revision), "Loading comparison…");
                 return Ok(());
             }
             Review => {
-                let text = if self.snapshot.head.is_some() {
-                    self.repo
-                        .text(&["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"])?
-                } else {
-                    self.repo
-                        .text(&["diff", "--cached", "--no-ext-diff", "--no-textconv", "--"])?
-                };
-                self.output(
-                    "Integration result against HEAD · includes staged + unstaged changes",
-                    if text.is_empty() {
-                        "No changes against HEAD.".into()
-                    } else {
-                        text
-                    },
+                self.detail(
+                    ReadKind::Review(self.snapshot.head.is_some()),
+                    "Loading integration diff…",
                 );
                 return Ok(());
             }
@@ -1182,7 +1578,13 @@ impl App {
                     .get(self.selected)
                     .context("Select a file")?;
                 let mut action = match command {
-                    Stage => new(&["add"]),
+                    Stage => {
+                        if !matches!(file.status.as_bytes()[0], b' ' | b'?') && file.status.as_bytes()[1] != b' ' {
+                            confirm = true;
+                            detail = format!("Replace the staged version of {:?} with its current working content?\nThe previous staged-only content may no longer be recoverable through normal Git history.", file.path);
+                        }
+                        new(&["add"])
+                    }
                     Unstage if self.snapshot.head.is_some() => new(&["restore", "--staged"]),
                     Unstage => new(&["rm", "--cached", "-f"]),
                     Discard => {
@@ -1207,17 +1609,25 @@ impl App {
                 }
                 action
             }
-            StageAll => new(&["add", "--all"]),
+            StageAll => {
+                if self.snapshot.files.iter().any(|file| {
+                    !matches!(file.status.as_bytes()[0], b' ' | b'?')
+                        && file.status.as_bytes()[1] != b' '
+                }) {
+                    confirm = true;
+                    detail = "Stage all files, replacing any previously staged versions with working content?\nPrevious staged-only content can be lost. Working files are not deleted.".into();
+                }
+                new(&["add", "--all"])
+            }
             UnstageAll if self.snapshot.head.is_some() => new(&["restore", "--staged", "--", "."]),
             UnstageAll => new(&["rm", "--cached", "-r", "-f", "--", "."]),
             Commit | Amend => {
                 let Some(message) = input else {
-                    let initial = if command == Amend {
-                        self.repo.text(&["log", "-1", "--format=%B"])?
+                    if command == Amend {
+                        self.detail(ReadKind::AmendMessage, "Loading commit message…");
                     } else {
-                        String::new()
-                    };
-                    self.prompt(command, "Commit message", initial);
+                        self.prompt(command, "Commit message", String::new());
+                    }
                     return Ok(());
                 };
                 if command == Amend {
@@ -1249,9 +1659,17 @@ impl App {
                             .get(self.selected)
                             .context("Select a branch")?
                             .name;
+                        confirm = true;
+                        detail = format!(
+                            "Rename local branch {branch} to {input}?\nThe old local branch name will be removed. Remote refs are unchanged."
+                        );
                         new(&["branch", "-m", "--", branch, &input]).idle()
                     }
-                    StashSave => new(&["stash", "push", "--include-untracked", "-m", &input]),
+                    StashSave => {
+                        confirm = true;
+                        detail = "Stash tracked and untracked changes, then remove them from the working tree?\nIgnored files are excluded. Review the resulting stash before dropping it.".into();
+                        new(&["stash", "push", "--include-untracked", "-m", &input])
+                    }
                     TagCreate => new(&["tag", "--", &input, "HEAD"]),
                     WorktreeAdd => new(&["worktree", "add", "--detach", "--", &input, "HEAD"]),
                     _ => unreachable!(),
@@ -1308,7 +1726,7 @@ impl App {
                     self.snapshot.branch
                 );
                 match command {
-                    Fetch => new(&["fetch", "--", &remote]),
+                    Fetch => new(&["fetch", "--no-prune", "--no-prune-tags", "--", &remote]),
                     PullFF => {
                         confirm = true;
                         new(&[
@@ -1451,13 +1869,15 @@ impl App {
                     .snapshot
                     .operation
                     .context("No operation in progress")?;
-                if command == Continue {
-                    self.repo.ensure_resolved()?;
-                }
-                confirm = command != Continue;
+                confirm = true;
                 detail = if command == Abort {
                     format!(
                         "Abort {}?\nResolution progress and operation changes may be discarded as Git restores the pre-operation state. Copy any manual edits you want to retain first.",
+                        operation.command()
+                    )
+                } else if command == Continue {
+                    format!(
+                        "Continue {}?\nThis may create commits, replay remaining commits, or complete a history rewrite.\nAll conflicted files must be resolved and staged first.",
                         operation.command()
                     )
                 } else {
@@ -1473,7 +1893,7 @@ impl App {
                 ])
             }
         };
-        if confirm {
+        if confirm || command.needs_confirmation() {
             self.modal = Some(Modal::Confirm {
                 task: Task::Git(action),
                 detail,
@@ -1488,11 +1908,13 @@ impl App {
         if self.busy.is_some() {
             return;
         }
+        self.cancel_reads();
         let repo = self.repo.clone();
         let label = match &task {
             Task::Git(action) | Task::Preview(action) => action.label.clone(),
             Task::Hunk(_) => "Apply selected hunk".into(),
             Task::Rebase(_) => "Interactive rebase".into(),
+            Task::SaveConflict(_) => "Save conflict resolution (not staged)".into(),
         };
         self.busy = Some(label.clone());
         self.error = None;
@@ -1500,11 +1922,23 @@ impl App {
         self.worker = Some(receiver);
         thread::spawn(move || {
             let preview = matches!(task, Task::Preview(_));
+            let mut saved_conflict = None;
             let output = match task {
                 Task::Git(action) => repo.execute(&action),
                 Task::Preview(action) => repo.merge_preview(&action),
                 Task::Hunk(hunks) => hunks.apply(&repo),
                 Task::Rebase(plan) => plan.execute(&repo),
+                Task::SaveConflict(mut conflict) => {
+                    let result = conflict.save(&repo).map(|()| GitOutput {
+                        success: true,
+                        stdout: b"Resolution saved to working tree. Not staged.\n".to_vec(),
+                        stderr: Vec::new(),
+                        truncated: false,
+                        stdout_fingerprint: 0,
+                    });
+                    saved_conflict = Some(conflict);
+                    result
+                }
             }
             .map_err(|error| format!("{error:#}"));
             let snapshot = repo.snapshot().map_err(|error| format!("{error:#}"));
@@ -1513,6 +1947,7 @@ impl App {
                 output,
                 snapshot,
                 preview,
+                conflict: saved_conflict,
             });
         });
     }
@@ -1531,11 +1966,9 @@ impl App {
         self.busy = None;
         self.worker = None;
         match result.snapshot {
-            Ok(snapshot) => self.snapshot = snapshot,
+            Ok(snapshot) => self.apply_snapshot(self.repo.clone(), snapshot),
             Err(error) => self.error = Some(format!("Could not refresh repository: {error}")),
         }
-        self.selected = self.selected.min(self.items().len().saturating_sub(1));
-        self.load_preview();
         match result.output {
             Ok(output) => {
                 self.last_output = format!("{}\n\n{}", result.label, output.text());
@@ -1568,18 +2001,249 @@ impl App {
                 self.error = Some(error);
             }
         }
+        if let Some(conflict) = result.conflict {
+            if conflict.dirty() {
+                self.quit_requested = false;
+            }
+            self.modal = Some(Modal::Conflict(conflict));
+        }
         true
     }
 
     fn refresh(&mut self) {
-        match self.repo.snapshot() {
-            Ok(snapshot) => {
-                self.snapshot = snapshot;
-                self.selected = self.selected.min(self.items().len().saturating_sub(1));
-                self.load_preview();
-                self.notice = "Repository refreshed".into();
+        if self.busy.is_none() && self.snapshot_read.is_none() {
+            self.snapshot_read = Some(self.read(ReadKind::Snapshot));
+        }
+    }
+
+    pub fn auto_refresh(&mut self, now: Instant) {
+        if self.busy.is_none()
+            && self.modal.is_none()
+            && (self.loaded || self.error.is_none())
+            && now.saturating_duration_since(self.last_refresh) >= Duration::from_secs(2)
+        {
+            self.refresh();
+        }
+    }
+
+    pub fn loading(&self) -> bool {
+        self.snapshot_read.is_some()
+            || self.preview_read.is_some()
+            || self.detail_read.is_some()
+            || self.commit_read.is_some()
+    }
+
+    fn read(&mut self, kind: ReadKind) -> u64 {
+        self.next_read = self.next_read.wrapping_add(1);
+        let id = self.next_read;
+        self.loader.request(Request {
+            id,
+            repo: self.repo.clone(),
+            kind,
+        });
+        id
+    }
+
+    fn detail(&mut self, kind: ReadKind, label: &str) {
+        self.preview_read = None;
+        self.preview_loading = false;
+        self.commit_read = None;
+        self.detail_read = Some(self.read(kind));
+        self.modal = Some(Modal::Loading(label.into()));
+    }
+
+    fn confirm_save(&mut self, conflict: Box<Conflict>) {
+        if !conflict.dirty() {
+            self.modal = Some(Modal::Conflict(conflict));
+            return;
+        }
+        self.modal = Some(Modal::Confirm {
+            detail: format!(
+                "Save the resolution over working file {:?}?\nThis replaces its on-disk contents, but does NOT stage or continue Git.\n{}\nExternal changes are checked again before writing.",
+                conflict.path,
+                if conflict.unresolved() > 0 {
+                    "Unresolved markers remain. This is a partial save."
+                } else {
+                    "All regions are resolved."
+                }
+            ),
+            task: Task::SaveConflict(conflict),
+        });
+    }
+
+    fn cancel_reads(&mut self) {
+        self.loader.clear();
+        self.snapshot_read = None;
+        self.preview_read = None;
+        self.detail_read = None;
+        self.commit_read = None;
+        self.preview_loading = false;
+        self.deferred_snapshot = None;
+    }
+
+    fn apply_snapshot(&mut self, repo: Repo, snapshot: Snapshot) {
+        let key = self.selected_key();
+        let index = self.selected;
+        self.repo = repo;
+        self.snapshot = snapshot;
+        self.loaded = true;
+        let count = self.items().len();
+        let retained = key.and_then(|key| {
+            (0..count).find(|candidate| {
+                self.selected = *candidate;
+                self.selected_key().as_ref() == Some(&key)
+            })
+        });
+        self.selected = retained.unwrap_or_else(|| index.min(count.saturating_sub(1)));
+        self.last_refresh = Instant::now();
+        self.request_preview(retained.is_none());
+    }
+
+    fn load_commit_preview(&mut self) {
+        if let Some(Modal::Commit(view)) = &mut self.modal {
+            view.preview = "Loading file…".into();
+            view.scroll = 0;
+            view.horizontal = 0;
+            let kind = ReadKind::CommitPreview {
+                commit: view.commit.clone(),
+                index: view.selected,
+                full: view.full,
+            };
+            self.commit_read = Some(self.read(kind));
+        }
+    }
+
+    pub fn poll_loading(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let response = match self.loader.try_recv() {
+                Ok(response) => response,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.cancel_reads();
+                    self.loader = Loader::new();
+                    self.fail(anyhow::anyhow!("Repository reader stopped unexpectedly. Press r to retry; no Git action was executed."));
+                    changed = true;
+                    break;
+                }
+            };
+            if self.snapshot_read == Some(response.id) {
+                self.snapshot_read = None;
+                self.last_refresh = Instant::now();
+                match response.result {
+                    Ok(ReadData::Snapshot(data)) => {
+                        if self.modal.is_some() || self.busy.is_some() {
+                            self.deferred_snapshot = Some(data);
+                        } else {
+                            let (repo, snapshot) = *data;
+                            self.apply_snapshot(repo, snapshot);
+                        }
+                    }
+                    Err(error) => {
+                        if !self.loaded {
+                            self.snapshot.branch = "Unavailable".into();
+                            self.preview =
+                                format!("Could not open repository:\n{error}\n\nr retry · q quit");
+                        }
+                        self.last_output = error.clone();
+                        self.error = Some(error);
+                    }
+                    _ => {}
+                }
+                changed = true;
+            } else if self.preview_read == Some(response.id) {
+                self.preview_read = None;
+                self.preview_loading = false;
+                self.preview = match response.result {
+                    Ok(ReadData::Preview(text)) => text,
+                    Err(error) => format!("Could not load preview:\n{error}"),
+                    _ => String::new(),
+                };
+                self.scroll = self.scroll.min(
+                    self.preview
+                        .lines()
+                        .count()
+                        .saturating_sub(1)
+                        .min(u16::MAX as usize) as u16,
+                );
+                changed = true;
+            } else if self.commit_read == Some(response.id) {
+                self.commit_read = None;
+                if let Some(Modal::Commit(view)) = &mut self.modal {
+                    view.preview = match response.result {
+                        Ok(ReadData::CommitPreview(text)) => text,
+                        Err(error) => format!("Could not load file:\n{error}"),
+                        _ => String::new(),
+                    };
+                    changed = true;
+                }
+            } else if self.detail_read == Some(response.id) {
+                self.detail_read = None;
+                if !matches!(self.modal, Some(Modal::Loading(_))) {
+                    continue;
+                }
+                self.modal = None;
+                match response.result {
+                    Ok(ReadData::Conflict(conflict)) => {
+                        self.modal = Some(Modal::Conflict(conflict))
+                    }
+                    Ok(ReadData::Hunks(hunks)) => self.modal = Some(Modal::Hunks(hunks)),
+                    Ok(ReadData::Rebase(plan)) => self.modal = Some(Modal::Rebase(plan)),
+                    Ok(ReadData::AmendMessage(message)) => {
+                        self.prompt(CommandId::Amend, "Commit message", message)
+                    }
+                    Ok(ReadData::Output { title, text }) => self.output(&title, text),
+                    Ok(ReadData::Commit(commit)) => {
+                        self.modal = Some(Modal::Commit(Box::new(CommitView {
+                            commit,
+                            selected: 0,
+                            focus: Focus::List,
+                            full: false,
+                            preview: String::new(),
+                            scroll: 0,
+                            horizontal: 0,
+                        })));
+                        self.load_commit_preview();
+                    }
+                    Err(error) => {
+                        self.last_output = error.clone();
+                        self.error = Some(error);
+                    }
+                    _ => {}
+                }
+                changed = true;
             }
-            Err(error) => self.fail(error),
+        }
+        if self.modal.is_none()
+            && self.busy.is_none()
+            && let Some(data) = self.deferred_snapshot.take()
+        {
+            let (repo, snapshot) = *data;
+            self.apply_snapshot(repo, snapshot);
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        match &mut self.modal {
+            Some(Modal::Inline { editor, .. }) => {
+                if let Err(error) = editor.paste(text) {
+                    self.fail(error);
+                }
+            }
+            Some(Modal::Prompt { input, .. })
+                if input.len() + text.len() <= crate::git::PREVIEW_LIMIT =>
+            {
+                input.extend(text.chars().filter(|character| {
+                    !character.is_control() || matches!(character, '\n' | '\t')
+                }));
+            }
+            Some(Modal::Palette { filter, selected }) if filter.len() + text.len() <= 4096 => {
+                filter.extend(text.chars().filter(|character| !character.is_control()));
+                *selected = 0;
+            }
+            _ => {} // Pasted y, commands, and shortcuts never execute actions.
         }
     }
 
@@ -1602,13 +2266,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn navigation_remains_available_while_a_preview_reader_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        Repo {
+            root: dir.path().into(),
+        }
+        .bytes(&["init", "-b", "main"])
+        .unwrap();
+        std::fs::write(dir.path().join("a"), "alpha").unwrap();
+        std::fs::write(dir.path().join("b"), "beta").unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
+        let (started, waiting) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let blocked = std::sync::Mutex::new(blocked);
+        app.loader = Loader::with_reader(move |_, _| {
+            started.send(()).unwrap();
+            blocked.lock().unwrap().recv().unwrap();
+            Ok(ReadData::Preview("slow preview".into()))
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Preview);
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn destructive_command_policy_is_explicit() {
+        use CommandId::*;
+        for command in [
+            Discard,
+            Amend,
+            BranchRename,
+            BranchDelete,
+            TakeCurrent,
+            TakeIncoming,
+            DeleteConflict,
+            StashSave,
+            StashPop,
+            StashDrop,
+            TagDelete,
+            WorktreeRemove,
+            Abort,
+            Skip,
+            Continue,
+            Unstage,
+            UnstageAll,
+        ] {
+            assert!(
+                command.needs_confirmation(),
+                "{:?} bypasses confirmation",
+                command
+            );
+        }
+    }
+
+    #[test]
     fn empty_repository_navigation_and_palette_are_safe() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repo {
             root: dir.path().into(),
         };
         repo.bytes(&["init", "-b", "main"]).unwrap();
-        let mut app = App::new(dir.path()).unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
         for code in [
             KeyCode::Up,
             KeyCode::Down,

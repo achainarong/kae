@@ -11,6 +11,90 @@ use crate::{
     rebase::{Plan, RebaseAction},
 };
 
+/// Textarea owns cursor movement, Unicode editing and per-keystroke undo.
+/// Keep line endings outside the widget, whose lines contain no terminators.
+pub struct ResultEditor {
+    pub area: ratatui_textarea::TextArea<'static>,
+    eol: &'static str,
+}
+
+impl ResultEditor {
+    pub fn new(text: &str) -> Result<Self> {
+        ensure!(
+            safe_editor_text(text),
+            "This file contains terminal control characters. Use the external editor (E) instead."
+        );
+        let crlf = text.matches("\r\n").count();
+        let lf = text.bytes().filter(|byte| *byte == b'\n').count();
+        ensure!(
+            (crlf == 0 || crlf == lf) && !text.replace("\r\n", "").contains('\r'),
+            "Mixed line endings require the external editor (E) to avoid normalizing your file."
+        );
+        let eol = if crlf > 0 { "\r\n" } else { "\n" };
+        let lines = text.split(eol).map(str::to_owned).collect();
+        let mut area = ratatui_textarea::TextArea::new(lines);
+        area.set_block(
+            ratatui::widgets::Block::bordered()
+                .title(" Result editor · Ctrl-S review save · Esc keep draft "),
+        );
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        area.set_line_number_style(
+            ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+        );
+        Ok(Self { area, eol })
+    }
+
+    pub fn text(&self) -> String {
+        self.area.lines().join(self.eol)
+    }
+
+    pub fn paste(&mut self, text: &str) -> Result<()> {
+        ensure!(
+            safe_editor_text(text),
+            "Paste contains unsupported control characters."
+        );
+        ensure!(
+            self.text().len() + text.len() <= crate::git::PREVIEW_LIMIT,
+            "Result exceeds the 256 KiB inline editing limit."
+        );
+        let normalized = text.replace("\r\n", "\n");
+        ensure!(
+            !normalized.contains('\r'),
+            "Paste contains standalone carriage returns; use the external editor to preserve them."
+        );
+        self.area.insert_str(normalized);
+        Ok(())
+    }
+}
+
+pub fn safe_editor_text(text: &str) -> bool {
+    text.chars().all(|character| {
+        (!character.is_control() || matches!(character, '\r' | '\n' | '\t'))
+            && !matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    })
+}
+
+pub struct PasteMode;
+impl PasteMode {
+    pub fn enable() -> Result<Self> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+        Ok(Self)
+    }
+    pub fn suspend(&self) -> Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste)?;
+        Ok(())
+    }
+    pub fn resume(&self) -> Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+        Ok(())
+    }
+}
+impl Drop for PasteMode {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    }
+}
+
 pub fn configure_git_editor(repo: &Repo, command: &mut Command) -> Result<()> {
     let executable = std::env::current_exe()?;
     // Integration tests run under a test harness; Git must launch the real CLI.
@@ -95,4 +179,27 @@ pub fn open(path: &Path) -> Result<()> {
         .with_context(|| format!("Could not start editor {program}. Set VISUAL or EDITOR."))?;
     ensure!(status.success(), "Editor exited unsuccessfully ({status})");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preserves_eol_and_eof_and_supports_widget_undo() {
+        for text in ["", "a", "a\n", "a\r\nb\r\n", "a\r\nb"] {
+            let mut editor = ResultEditor::new(text).unwrap();
+            assert_eq!(editor.text(), text);
+            editor.area.insert_str("inserted");
+            editor.area.undo();
+            assert_eq!(editor.text(), text);
+        }
+        assert!(ResultEditor::new("a\r\nb\n").is_err());
+        assert!(ResultEditor::new("unsafe\x1b[31m").is_err());
+        let mut editor = ResultEditor::new("safe").unwrap();
+        assert!(editor.paste("\x1b[31m").is_err());
+        assert!(editor.paste("\rhidden").is_err());
+        let mut editor = ResultEditor::new("").unwrap();
+        editor.paste("a\r\n").unwrap();
+        assert_eq!(editor.text(), "a\n");
+    }
 }

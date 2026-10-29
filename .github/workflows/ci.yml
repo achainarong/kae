@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install tested Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+      - name: Formatting, lint, unit and integration tests
+        run: make check
+      - name: Installer syntax
+        run: sh -n scripts/install.sh
+      - name: Release build
+        run: make release
+      - name: CLI smoke test
+        run: |
+          ./target/release/kae --version
+          ./target/release/kae --help

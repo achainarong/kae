@@ -20,7 +20,14 @@ const MUTED: Color = Color::DarkGray;
 pub fn minimum_size(app: &App) -> (u16, u16) {
     if matches!(
         app.modal,
-        Some(Modal::Conflict(_) | Modal::Hunks(_) | Modal::Rebase(_) | Modal::Confirm { .. })
+        Some(
+            Modal::Conflict(_)
+                | Modal::Inline { .. }
+                | Modal::Commit(_)
+                | Modal::Hunks(_)
+                | Modal::Rebase(_)
+                | Modal::Confirm { .. }
+        )
     ) {
         (60, 24)
     } else {
@@ -93,68 +100,75 @@ pub fn draw(frame: &mut Frame, app: &App) {
         rows[1],
     );
 
-    let panes = split(
-        rows[2],
-        if app.workspace == Workspace::History {
-            50
-        } else {
-            32
-        },
-    );
-    let items: Vec<ListItem> = app
-        .items()
-        .into_iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let text = if app.workspace == Workspace::History {
-                Text::from(
-                    item.lines()
-                        .map(|line| Line::raw(safe_text(line)))
-                        .collect::<Vec<_>>(),
-                )
+    if app.modal.is_none() {
+        let panes = split(
+            rows[2],
+            if app.workspace == Workspace::History {
+                50
             } else {
-                Text::raw(safe_text(&item))
-            };
-            let color =
-                if app.workspace == Workspace::Files && app.snapshot.files[index].is_conflict() {
+                32
+            },
+        );
+        let items: Vec<ListItem> = app
+            .items()
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let text = if app.workspace == Workspace::History {
+                    Text::from(
+                        item.lines()
+                            .map(|line| Line::raw(safe_text(line)))
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    Text::raw(safe_text(&item))
+                };
+                let color = if app.workspace == Workspace::Files
+                    && app.snapshot.files[index].is_conflict()
+                {
                     Color::Red
                 } else if app.workspace == Workspace::History {
                     Color::LightBlue
                 } else {
                     Color::Reset
                 };
-            ListItem::new(text).style(Style::default().fg(color))
-        })
-        .collect();
-    let title = format!(
-        " {} · {} {} ",
-        app.workspace.title(),
-        items.len(),
-        if app.workspace == Workspace::History {
-            "commits (latest 300)"
+                ListItem::new(text).style(Style::default().fg(color))
+            })
+            .collect();
+        let title = format!(
+            " {} · {} {} ",
+            app.workspace.title(),
+            items.len(),
+            if app.workspace == Workspace::History {
+                "commits (latest 300)"
+            } else {
+                "items"
+            }
+        );
+        let list = List::new(items)
+            .block(panel(title, app.focus == Focus::List))
+            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White).bold())
+            .highlight_symbol("› ");
+        let mut state = ListState::default().with_selected(if app.items().is_empty() {
+            None
         } else {
-            "items"
-        }
-    );
-    let list = List::new(items)
-        .block(panel(title, app.focus == Focus::List))
-        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White).bold())
-        .highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(if app.items().is_empty() {
-        None
-    } else {
-        Some(app.selected)
-    });
-    frame.render_stateful_widget(list, panes[0], &mut state);
-    frame.render_widget(
-        Paragraph::new(diff_text(&app.preview))
-            .scroll((app.scroll, app.horizontal))
+            Some(app.selected)
+        });
+        frame.render_stateful_widget(list, panes[0], &mut state);
+        frame.render_widget(
+            Paragraph::new(diff_window(
+                &app.preview,
+                usize::from(app.scroll),
+                panes[1].height.saturating_sub(2),
+            ))
+            .scroll((0, app.horizontal))
             .block(panel(
-                " Diff / details · Tab focus · h/l horizontal ".into(),
+                " Diff / details · Enter browse commit · Tab focus ".into(),
                 app.focus == Focus::Preview,
             )),
-        panes[1],
-    );
+            panes[1],
+        );
+    }
 
     if let Some(modal) = &app.modal {
         draw_modal(frame, app, modal, rows[2]);
@@ -169,6 +183,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         (error.as_str(), Color::Red)
     } else if let Some(busy) = &app.busy {
         (busy.as_str(), Color::Yellow)
+    } else if app.loading() {
+        ("Loading repository / preview…", MUTED)
     } else {
         (app.notice.as_str(), MUTED)
     };
@@ -216,9 +232,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
     frame.render_widget(Clear, area);
     match modal {
+        Modal::Loading(label) => frame.render_widget(
+            Paragraph::new(format!("\n{}\n\nEsc / q cancel loading", safe_text(label)))
+                .block(panel(" Loading · read only ".into(), true)),
+            area,
+        ),
         Modal::Help { scroll } => {
             frame.render_widget(Paragraph::new(
-                "Navigate: 1–7 workspace · [/] previous/next · Tab list/preview\nj/k or arrows move · h/l scroll horizontally · PgUp/PgDn scroll\n\nFiles: s stage · u unstage · S/U all · v hunks · e external editor\nEnter on conflict: resolve · c commit · a amend\nBranches: Enter switch · b new branch\nHistory / branches / tags: m preview merge · M merge\nHistory: i interactive rebase (selected commit is the base)\nRemotes: f fetch · p pull fast-forward only · P push\nOperation: C continue · A abort · : for skip and integration review\n\n: or / opens searchable commands, including stash/tag/worktree actions.\nPrompts: type, Backspace, Ctrl-U clear, Enter accept, Esc cancel.\nConfirmations: y proceeds; n / Esc cancels.\nConflicts: 1 current · 2 incoming · 3 current+incoming · 4 reverse\nn/p region · u undo · b base · s save · a stage · e editor\nRebase: j/k select · J/K reorder · p/r/s/f/d/e actions · Enter review\n\nr refresh · ~ last output · q quit / close · Ctrl-C quit when idle\nNetwork auth must be configured externally; no automatic force pushes."
+                "Navigate: 1–7 workspace · [/] previous/next · Tab list/preview\nj/k or arrows move · h/l scroll horizontally · PgUp/PgDn scroll\n\nFiles: s stage · u unstage · S/U all · v hunks · e external editor\nEnter on conflict: resolve · c commit · a amend\nBranches: Enter switch · b new branch\nHistory: Enter files · j/k select · Tab diff · t full file · P parent\nHistory / branches / tags: m preview merge · M merge\nHistory: i interactive rebase (selected commit is the base)\nRemotes: f fetch · p pull fast-forward only · P push\nOperation: C review continue · A review abort · : skip / integration review\n\n: or / opens searchable commands, including stash/tag/worktree actions.\nPrompts: type, Backspace, Ctrl-U clear, Enter accept, Esc cancel.\nConfirmations: only typed y proceeds; n / Esc cancels. Paste never confirms.\nConflicts: 1 current · 2 incoming · 3 current+incoming · 4 reverse\nn/p region · u undo · b base · s review save · a stage · e inline · E external\nInline: type / arrows · Ctrl-Z undo · Ctrl-Y redo · Ctrl-S review save\nEsc keeps the inline draft; it does not write or discard it.\nRebase: j/k select · J/K reorder · p/r/s/f/d/e actions · Enter review\n\nr refresh (also automatic every 2s outside dialogs) · ~ output · q close/quit\nNetwork auth must be configured externally; no automatic force pushes."
             ).wrap(Wrap { trim: false }).scroll((*scroll, 0)).block(panel(" Help · j/k scroll · Esc close ".into(), true)), area);
         }
         Modal::Palette { filter, selected } => {
@@ -261,19 +282,22 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             );
         }
         Modal::Confirm { detail, .. } => {
+            let block = Block::bordered()
+                .title(" Review action · j/k scroll · confirmation required ")
+                .border_style(Style::default().fg(Color::Yellow));
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
             frame.render_widget(
                 Paragraph::new(format!(
-                    "\n{}\n\n[y] Proceed    [n / Esc] Cancel",
+                    "\n{}",
                     detail.lines().map(safe_text).collect::<Vec<_>>().join("\n")
                 ))
                 .wrap(Wrap { trim: false })
-                .block(
-                    Block::bordered()
-                        .title(" Review action · explicit confirmation required ")
-                        .border_style(Style::default().fg(Color::Yellow)),
-                ),
-                area,
+                .scroll((app.confirm_scroll, 0)),
+                rows[0],
             );
+            frame.render_widget(Paragraph::new("[y] Proceed    [n / Esc] Cancel\nOnly typed y confirms; pasted text never executes."), rows[1]);
         }
         Modal::Output {
             title,
@@ -282,19 +306,29 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             horizontal,
         } => {
             frame.render_widget(
-                Paragraph::new(diff_text(text))
-                    .scroll((*scroll, *horizontal))
-                    .block(panel(
-                        format!(
-                            " {} · j/k scroll · h/l horizontal · Esc close ",
-                            safe_text(title)
-                        ),
-                        true,
-                    )),
+                Paragraph::new(diff_window(
+                    text,
+                    usize::from(*scroll),
+                    area.height.saturating_sub(2),
+                ))
+                .scroll((0, *horizontal))
+                .block(panel(
+                    format!(
+                        " {} · j/k scroll · h/l horizontal · Esc close ",
+                        safe_text(title)
+                    ),
+                    true,
+                )),
                 area,
             );
         }
         Modal::Conflict(conflict) => draw_conflict(frame, conflict, area),
+        Modal::Inline { editor, .. } => {
+            let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
+            frame.render_widget(&editor.area, rows[0]);
+            frame.render_widget(Paragraph::new("Type to edit · arrows / Home / End move · Ctrl-Z undo · Ctrl-Y redo\nCtrl-S review save (not stage) · Esc keep draft and return · q inserts text"), rows[1]);
+        }
+        Modal::Commit(view) => draw_commit(frame, view, area),
         Modal::Hunks(hunks) => draw_hunks(frame, hunks, area),
         Modal::Rebase(plan) => draw_rebase(frame, plan, area),
     }
@@ -308,8 +342,14 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
     ])
     .split(area);
     let regions = conflict.regions();
-    let region = regions[conflict.selected];
-    let choice = match region.choice {
+    let region = regions.get(conflict.selected).copied();
+    let current = region
+        .map(|region| region.current.as_str())
+        .unwrap_or(&conflict.current_file);
+    let incoming = region
+        .map(|region| region.incoming.as_str())
+        .unwrap_or(&conflict.incoming_file);
+    let choice = match region.and_then(|region| region.choice) {
         None => "unresolved",
         Some(Choice::Current) => "current",
         Some(Choice::Incoming) => "incoming",
@@ -320,10 +360,20 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
         Paragraph::new(format!(
             " {} · region {}/{} · {} unresolved · {} · {}",
             safe_text(&conflict.path.to_string_lossy()),
-            conflict.selected + 1,
+            if regions.is_empty() {
+                0
+            } else {
+                conflict.selected + 1
+            },
             regions.len(),
             conflict.unresolved(),
-            choice,
+            if conflict.parse_error.is_some() {
+                "repair malformed markers in editor"
+            } else if regions.is_empty() {
+                "manual result"
+            } else {
+                choice
+            },
             if conflict.dirty() {
                 "UNSAVED"
             } else {
@@ -353,7 +403,7 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
         })
         .split(body[0]);
     frame.render_widget(
-        Paragraph::new(word_diff(&region.current, &region.incoming, true))
+        Paragraph::new(word_diff(current, incoming, true))
             .scroll((conflict.scroll, conflict.horizontal))
             .block(panel(
                 format!(" {} ", safe_text(&conflict.current_label)),
@@ -366,14 +416,13 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
         frame.render_widget(
             Paragraph::new(diff_text(
                 region
-                    .base
-                    .as_deref()
+                    .and_then(|region| region.base.as_deref())
                     .or(conflict.base_file.as_deref())
                     .unwrap_or("No common-ancestor blob (for example, an add/add conflict)."),
             ))
             .scroll((conflict.scroll, conflict.horizontal))
             .block(panel(
-                if region.base.is_some() {
+                if region.is_some_and(|region| region.base.is_some()) {
                     " Common ancestor · region "
                 } else {
                     " Common ancestor · full file "
@@ -385,7 +434,7 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
         );
     }
     frame.render_widget(
-        Paragraph::new(word_diff(&region.current, &region.incoming, false))
+        Paragraph::new(word_diff(current, incoming, false))
             .scroll((conflict.scroll, conflict.horizontal))
             .block(panel(
                 format!(" {} ", safe_text(&conflict.incoming_label)),
@@ -400,7 +449,7 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
                 conflict.horizontal,
             ))
             .block(panel(
-                " Result · complete file · e manual edit · s save (not stage) ".into(),
+                " Result · e inline edit · E external · s review save ".into(),
                 true,
             )),
         body[1],
@@ -408,7 +457,7 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
     let footer = if conflict.confirm_close {
         "Discard UNSAVED in-memory choices? y discard / n keep editing. Saved file changes are retained."
     } else {
-        "1 current · 2 incoming · 3 current+incoming · 4 incoming+current · u undo · n/p region\nb base · j/k scroll · h/l horizontal · s save · a stage · e editor · q close"
+        "1 current · 2 incoming · 3 current+incoming · 4 reverse · u undo · n/p region\nb base · j/k scroll · s review save · a stage · e inline · E external · q close"
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(if conflict.confirm_close {
@@ -418,6 +467,102 @@ fn draw_conflict(frame: &mut Frame, conflict: &Conflict, area: Rect) {
         })),
         rows[2],
     );
+}
+
+fn draw_commit(frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(area);
+    let parent = if view.commit.parents.is_empty() {
+        "root commit vs empty tree".into()
+    } else {
+        format!(
+            "parent {}/{} · {}",
+            view.commit.parent + 1,
+            view.commit.parents.len(),
+            &view.commit.parents[view.commit.parent][..10]
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {} {}\n {} · read only",
+            &view.commit.oid[..10],
+            safe_text(&view.commit.subject),
+            parent
+        ))
+        .style(Style::default().fg(ACCENT)),
+        rows[0],
+    );
+    let panes = split(rows[1], 32);
+    let items = view
+        .commit
+        .files
+        .iter()
+        .map(|file| {
+            ListItem::new(format!(
+                "{} {}{}",
+                file.status,
+                safe_text(&file.path.to_string_lossy()),
+                file.original
+                    .as_ref()
+                    .map(|path| format!(" ← {}", safe_text(&path.to_string_lossy())))
+                    .unwrap_or_default()
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(if items.is_empty() {
+        None
+    } else {
+        Some(view.selected)
+    });
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(panel(" Changed files ".into(), view.focus == Focus::List))
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().bg(Color::DarkGray).bold()),
+        panes[0],
+        &mut state,
+    );
+    let height = usize::from(panes[1].height.saturating_sub(2));
+    let text = if view.full {
+        Text::from(
+            view.preview
+                .lines()
+                .enumerate()
+                .skip(view.scroll)
+                .take(height)
+                .map(|(index, line)| Line::raw(format!("{:>5} {}", index + 1, safe_text(line))))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        diff_window(
+            &view.preview,
+            view.scroll,
+            panes[1].height.saturating_sub(2),
+        )
+    };
+    let title = if !view.full {
+        " File diff "
+    } else if view
+        .commit
+        .files
+        .get(view.selected)
+        .is_some_and(|file| file.status == "D")
+    {
+        " Full file · parent version (deleted in commit) "
+    } else {
+        " Full file · committed version "
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .scroll((0, view.horizontal))
+            .block(panel(title.into(), view.focus == Focus::Preview)),
+        panes[1],
+    );
+    frame.render_widget(Paragraph::new("j/k select file or scroll · Tab / Enter focus diff · h/l horizontal · n/p hunk\nt toggle full file / diff · P compare another merge parent · Esc / q history"), rows[2]);
 }
 
 fn draw_hunks(frame: &mut Frame, hunks: &Hunks, area: Rect) {
@@ -584,6 +729,17 @@ fn diff_text(text: &str) -> Text<'static> {
     )
 }
 
+fn diff_window(text: &str, start: usize, height: u16) -> Text<'static> {
+    diff_text(
+        &text
+            .lines()
+            .skip(start)
+            .take(usize::from(height))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 fn split(area: Rect, left: u16) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(if area.width >= 100 {
@@ -634,7 +790,7 @@ mod tests {
         }
         .bytes(&["init", "-b", "main"])
         .unwrap();
-        let mut app = App::new(dir.path()).unwrap();
+        let mut app = App::ready(dir.path()).unwrap();
         for (width, height) in [(140, 40), (60, 24), (20, 6), (44, 12)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             for workspace in Workspace::ALL {

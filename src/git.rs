@@ -117,7 +117,7 @@ pub struct Worktree {
 
 /// Optimistic guard: reject an action if HEAD, index, operation or changed-file
 /// contents changed while a preview / confirmation was open.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Guard {
     head: Option<String>,
     symbolic_head: Option<String>,
@@ -142,6 +142,40 @@ pub struct Snapshot {
     pub tags: Vec<String>,
     pub worktrees: Vec<Worktree>,
     pub guard: Guard,
+}
+
+impl Snapshot {
+    pub fn loading() -> Self {
+        Self {
+            branch: "Loading…".into(),
+            head: None,
+            operation: None,
+            files: Vec::new(),
+            commits: Vec::new(),
+            branches: Vec::new(),
+            remotes: Vec::new(),
+            stashes: Vec::new(),
+            tags: Vec::new(),
+            worktrees: Vec::new(),
+            guard: Guard::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CommittedFile {
+    pub status: String,
+    pub path: PathBuf,
+    pub original: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommitFiles {
+    pub oid: String,
+    pub subject: String,
+    pub parents: Vec<String>,
+    pub parent: usize,
+    pub files: Vec<CommittedFile>,
 }
 
 #[derive(Clone, Debug)]
@@ -243,7 +277,15 @@ impl Repo {
         // In particular, a global literal flag makes stash -u leave files behind.
         if args.first().is_some_and(|arg| {
             [
-                "add", "diff", "show", "restore", "checkout", "rm", "clean", "ls-files",
+                "add",
+                "diff",
+                "diff-tree",
+                "show",
+                "restore",
+                "checkout",
+                "rm",
+                "clean",
+                "ls-files",
             ]
             .iter()
             .any(|name| arg == name)
@@ -648,6 +690,126 @@ impl Repo {
             revision,
             "--",
         ])
+    }
+
+    pub fn commit_files(&self, oid: &str, parent: usize) -> Result<CommitFiles> {
+        let oid = self.text(&["rev-parse", "--verify", &format!("{oid}^{{commit}}")])?;
+        let parents = self
+            .text(&["show", "-s", "--format=%P", &oid, "--"])?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let parent = parent.min(parents.len().saturating_sub(1));
+        let mut args = strings(&[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-z",
+            "-M",
+        ]);
+        if let Some(base) = parents.get(parent) {
+            args.push(base.into());
+        } else {
+            args.push("--root".into());
+        }
+        args.extend([oid.clone().into(), "--".into()]);
+        let output = self.checked(&args, None)?;
+        let mut fields = output
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty());
+        let mut files = Vec::new();
+        while let Some(status) = fields.next() {
+            let status = std::str::from_utf8(status)?.to_owned();
+            let first = PathBuf::from(os_bytes(fields.next().context("Missing historical path")?)?);
+            let (path, original) = if status.starts_with(['R', 'C']) {
+                (
+                    PathBuf::from(os_bytes(
+                        fields.next().context("Missing renamed destination")?,
+                    )?),
+                    Some(first),
+                )
+            } else {
+                (first, None)
+            };
+            files.push(CommittedFile {
+                status,
+                path,
+                original,
+            });
+        }
+        Ok(CommitFiles {
+            subject: self.text(&["show", "-s", "--format=%s", &oid, "--"])?,
+            oid,
+            parents,
+            parent,
+            files,
+        })
+    }
+
+    pub fn historical_preview(
+        &self,
+        commit: &CommitFiles,
+        index: usize,
+        full: bool,
+    ) -> Result<String> {
+        let Some(file) = commit.files.get(index) else {
+            return Ok("No files changed against this parent.".into());
+        };
+        if full {
+            let revision = if file.status == "D" {
+                commit
+                    .parents
+                    .get(commit.parent)
+                    .context("Deleted file has no parent")?
+            } else {
+                &commit.oid
+            };
+            let mut object = OsString::from(format!("{revision}:"));
+            object.push(&file.path);
+            let bytes = self.checked(
+                &[
+                    "show".into(),
+                    "--no-ext-diff".into(),
+                    "--no-textconv".into(),
+                    object,
+                ],
+                None,
+            )?;
+            return Ok(preview_text(&bytes));
+        }
+        let mut args = if let Some(base) = commit.parents.get(commit.parent) {
+            strings(&[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "-M",
+                base,
+                &commit.oid,
+            ])
+        } else {
+            strings(&[
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--no-ext-diff",
+                "--no-textconv",
+                "-p",
+                "-r",
+                &commit.oid,
+            ])
+        };
+        args.push("--".into());
+        args.push(file.path.as_os_str().to_owned());
+        if let Some(original) = &file.original {
+            args.push(original.as_os_str().to_owned());
+        }
+        let output = self.checked(&args, None)?;
+        Ok(if output.is_empty() {
+            "No textual changes for this file.".into()
+        } else {
+            preview_text(&output)
+        })
     }
 
     pub fn ensure_resolved(&self) -> Result<()> {

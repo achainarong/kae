@@ -78,9 +78,25 @@ pub struct Conflict {
     pub base_file: Option<String>,
     pub confirm_close: bool,
     pub guard: Guard,
+    pub current_file: String,
+    pub incoming_file: String,
+    pub parse_error: Option<String>,
+    source_no_eol: (bool, bool),
     loaded: Vec<u8>,
-    saved_choices: Vec<Option<Choice>>,
-    undo: Vec<Vec<Option<Choice>>>,
+    undo: Vec<Undo>,
+}
+
+#[derive(Clone, Debug)]
+enum Undo {
+    Choice {
+        region: usize,
+        previous: Option<Choice>,
+    },
+    Edit {
+        segments: Vec<Segment>,
+        selected: usize,
+        parse_error: Option<String>,
+    },
 }
 
 impl Conflict {
@@ -115,6 +131,8 @@ impl Conflict {
         let mut base_file = None;
         let mut current_no_eol = false;
         let mut incoming_no_eol = false;
+        let mut current_file = String::new();
+        let mut incoming_file = String::new();
         for record in unmerged.split(|byte| *byte == 0) {
             let metadata = record
                 .split(|byte| *byte == b'\t')
@@ -137,8 +155,10 @@ impl Conflict {
                 let no_eol = !bytes.is_empty() && !bytes.ends_with(b"\n");
                 if fields[2] == "2" {
                     current_no_eol = no_eol;
+                    current_file = crate::git::preview_text(&bytes);
                 } else {
                     incoming_no_eol = no_eol;
+                    incoming_file = crate::git::preview_text(&bytes);
                 }
             }
         }
@@ -186,8 +206,11 @@ impl Conflict {
             base_file,
             confirm_close: false,
             guard,
+            current_file,
+            incoming_file,
+            parse_error: None,
+            source_no_eol: (current_no_eol, incoming_no_eol),
             loaded: bytes,
-            saved_choices: vec![None; count],
             undo: Vec::new(),
         })
     }
@@ -203,21 +226,23 @@ impl Conflict {
     }
 
     pub fn unresolved(&self) -> usize {
+        if self.parse_error.is_some() {
+            return 1;
+        }
         self.regions()
             .iter()
             .filter(|region| region.choice.is_none())
             .count()
     }
 
-    fn choices(&self) -> Vec<Option<Choice>> {
-        self.regions().iter().map(|region| region.choice).collect()
-    }
-
     pub fn dirty(&self) -> bool {
-        self.choices() != self.saved_choices
+        self.result().as_bytes() != self.loaded
     }
 
     pub fn choose(&mut self, choice: Choice) {
+        let Some(region) = self.regions().get(self.selected).copied() else {
+            return;
+        };
         if self
             .regions()
             .get(self.selected)
@@ -225,10 +250,11 @@ impl Conflict {
         {
             return;
         }
-        if self.undo.len() >= 256 {
-            self.undo.remove(0);
-        }
-        self.undo.push(self.choices());
+        self.undo.push(Undo::Choice {
+            region: self.selected,
+            previous: region.choice,
+        });
+        self.trim_undo();
         let mut index = 0;
         for segment in &mut self.segments {
             if let Segment::Conflict(region) = segment {
@@ -242,14 +268,73 @@ impl Conflict {
     }
 
     pub fn undo(&mut self) {
-        if let Some(choices) = self.undo.pop() {
-            let mut choices = choices.into_iter();
-            for segment in &mut self.segments {
-                if let Segment::Conflict(region) = segment {
-                    region.choice = choices.next().flatten();
+        match self.undo.pop() {
+            Some(Undo::Choice { region, previous }) => {
+                if let Some(Segment::Conflict(target)) = self
+                    .segments
+                    .iter_mut()
+                    .filter(|segment| matches!(segment, Segment::Conflict(_)))
+                    .nth(region)
+                {
+                    target.choice = previous;
                 }
             }
+            Some(Undo::Edit {
+                segments,
+                selected,
+                parse_error,
+            }) => {
+                self.segments = segments;
+                self.selected = selected;
+                self.parse_error = parse_error;
+            }
+            None => {}
         }
+    }
+
+    fn trim_undo(&mut self) {
+        while self.undo.len() > 256
+            || self
+                .undo
+                .iter()
+                .filter(|undo| matches!(undo, Undo::Edit { .. }))
+                .count()
+                > 16
+        {
+            self.undo.remove(0);
+        }
+    }
+
+    pub fn edit_result(&mut self, text: String) -> Result<()> {
+        ensure!(
+            text.len() <= PREVIEW_LIMIT,
+            "Result exceeds the 256 KiB editing limit."
+        );
+        if text == self.result() {
+            return Ok(());
+        }
+        self.undo.push(Undo::Edit {
+            segments: self.segments.clone(),
+            selected: self.selected,
+            parse_error: self.parse_error.clone(),
+        });
+        self.trim_undo();
+        match parse(&text) {
+            Ok(mut segments) => {
+                if let Some(Segment::Conflict(region)) = segments.last_mut() {
+                    region.current_no_eol = self.source_no_eol.0;
+                    region.incoming_no_eol = self.source_no_eol.1;
+                }
+                self.segments = segments;
+                self.parse_error = None;
+            }
+            Err(error) => {
+                self.segments = vec![Segment::Text(text)];
+                self.parse_error = Some(error.to_string());
+            }
+        }
+        self.selected = self.selected.min(self.regions().len().saturating_sub(1));
+        Ok(())
     }
 
     pub fn result(&self) -> String {
@@ -297,7 +382,6 @@ impl Conflict {
         temporary.as_file().sync_all()?;
         temporary.persist(&path).map_err(|error| error.error)?;
         self.loaded = result.into_bytes();
-        self.saved_choices = self.choices();
         self.guard = repo.guard()?;
         Ok(())
     }

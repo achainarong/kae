@@ -12,6 +12,8 @@ mod editor;
 mod git;
 #[path = "../src/graph.rs"]
 mod graph;
+#[path = "../src/loader.rs"]
+mod loader;
 #[path = "../src/rebase.rs"]
 mod rebase;
 #[path = "../src/ui.rs"]
@@ -981,20 +983,32 @@ fn key(app: &mut app::App, code: KeyCode) {
     app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
 }
 
+fn render_views(app: &app::App) {
+    use ratatui::{Terminal, backend::TestBackend};
+    for (width, height) in [(140, 40), (60, 24), (44, 12)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+    }
+}
+
 fn wait(app: &mut app::App) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while app.busy.is_some() && Instant::now() < deadline {
+    while (app.busy.is_some() || app.loading()) && Instant::now() < deadline {
         app.poll_worker();
+        app.poll_loading();
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(app.busy.is_none(), "worker did not finish");
+    assert!(
+        app.busy.is_none() && !app.loading(),
+        "worker / loader did not finish"
+    );
 }
 
 #[test]
 fn ui_stage_commit_and_destructive_confirmation_flow() {
     let fixture = Fixture::new();
     fixture.write("file", "initial\n");
-    let mut app = app::App::new(&fixture.repo.root).unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
     key(&mut app, KeyCode::Char('s'));
     wait(&mut app);
     assert!(app.error.is_none(), "{:?}", app.error);
@@ -1010,6 +1024,7 @@ fn ui_stage_commit_and_destructive_confirmation_flow() {
     );
     fixture.write("file", "edited\n");
     key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
     key(&mut app, KeyCode::Char(':'));
     for character in "discard".chars() {
         key(&mut app, KeyCode::Char(character));
@@ -1043,7 +1058,7 @@ fn ui_stage_commit_and_destructive_confirmation_flow() {
 fn quitting_during_a_worker_requests_orderly_completion() {
     let fixture = Fixture::new();
     fixture.write("file", "keep this content\n");
-    let mut app = app::App::new(&fixture.repo.root).unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
     key(&mut app, KeyCode::Char('s'));
     assert!(app.busy.is_some());
     key(&mut app, KeyCode::Char('q'));
@@ -1064,13 +1079,16 @@ fn ui_stages_updates_to_a_staged_rename_and_unstages_both_paths() {
     fixture.commit("old", &original, "base");
     fixture.repo.bytes(&["mv", "old", "new"]).unwrap();
     fixture.write("new", &format!("{original}additional line\n"));
-    let mut app = app::App::new(&fixture.repo.root).unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
     assert!(app.snapshot.files[0].original.is_some());
     key(&mut app, KeyCode::Char('s'));
+    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
+    key(&mut app, KeyCode::Char('y'));
     wait(&mut app);
     assert!(app.error.is_none(), "{:?}", app.error);
     assert!(fixture.repo.bytes(&["diff", "--"]).unwrap().is_empty());
     key(&mut app, KeyCode::Char('u'));
+    key(&mut app, KeyCode::Char('y'));
     wait(&mut app);
     assert!(app.error.is_none(), "{:?}", app.error);
     assert_eq!(fixture.repo.text(&["ls-files"]).unwrap(), "old");
@@ -1097,7 +1115,7 @@ fn ui_push_names_the_actual_upstream_destination() {
         .repo
         .bytes(&["config", "branch.main.merge", "refs/heads/trunk"])
         .unwrap();
-    let mut app = app::App::new(&fixture.repo.root).unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
     key(&mut app, KeyCode::Char('P'));
     let Some(app::Modal::Confirm {
         task: app::Task::Git(action),
@@ -1123,8 +1141,9 @@ fn ui_conflict_and_rebase_workspaces_render_real_content_and_safe_cancel() {
     use ratatui::{Terminal, backend::TestBackend};
     let fixture = Fixture::new();
     fixture.conflict();
-    let mut app = app::App::new(&fixture.repo.root).unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
     key(&mut app, KeyCode::Enter);
+    wait(&mut app);
     assert!(matches!(app.modal, Some(app::Modal::Conflict(_))));
     key(&mut app, KeyCode::Char('3'));
     for (width, height) in [(140, 40), (60, 24), (44, 12)] {
@@ -1201,4 +1220,431 @@ fn non_utf8_paths_are_preserved_and_symlink_edits_refused() {
         fs::read_to_string(outside.path().join("precious")).unwrap(),
         "do not overwrite"
     );
+}
+
+#[test]
+fn asynchronous_refresh_preserves_selection_scroll_and_defers_confirmations() {
+    let fixture = Fixture::new();
+    let mut app = app::App::new(&fixture.repo.root).unwrap();
+    assert!(!app.loaded);
+    wait(&mut app);
+    fixture.write("a", "alpha\n");
+    fixture.write("b", "beta\nline2\nline3\nline4\n");
+    app.auto_refresh(Instant::now() + Duration::from_secs(3));
+    wait(&mut app);
+    assert_eq!(app.snapshot.files.len(), 2);
+    key(&mut app, KeyCode::Char('j'));
+    wait(&mut app);
+    assert_eq!(app.snapshot.files[app.selected].path, Path::new("b"));
+    app.scroll = 2;
+    app.horizontal = 4;
+    fixture.write("0-new", "new\n");
+    app.auto_refresh(Instant::now() + Duration::from_secs(3));
+    wait(&mut app);
+    assert_eq!(app.snapshot.files[app.selected].path, Path::new("b"));
+    assert_eq!((app.scroll, app.horizontal), (2, 4));
+    fixture.write("c", "later\n");
+    key(&mut app, KeyCode::Char('r'));
+    key(&mut app, KeyCode::Char(':'));
+    for character in "discard".chars() {
+        key(&mut app, KeyCode::Char(character));
+    }
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
+    assert_eq!(
+        app.snapshot.files.len(),
+        3,
+        "an in-flight refresh replaced a confirmation's context"
+    );
+    app.handle_paste("y");
+    assert!(app.busy.is_none(), "pasted confirmation must never execute");
+    key(&mut app, KeyCode::Char('n'));
+    app.poll_loading();
+    wait(&mut app);
+    assert_eq!(app.snapshot.files.len(), 4);
+    assert!(fixture.repo.root.join("b").exists());
+}
+
+#[test]
+fn rapid_navigation_ignores_stale_preview_results() {
+    let fixture = Fixture::new();
+    fixture.write("a", "UNIQUE_ALPHA\n");
+    fixture.write("b", "UNIQUE_BETA\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    for _ in 0..30 {
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('k'));
+    }
+    key(&mut app, KeyCode::Char('j'));
+    wait(&mut app);
+    assert_eq!(app.snapshot.files[app.selected].path, Path::new("b"));
+    assert!(app.preview.contains("UNIQUE_BETA") && !app.preview.contains("UNIQUE_ALPHA"));
+}
+
+#[test]
+fn inline_editing_save_cancel_undo_and_stage_are_separate() {
+    let fixture = Fixture::new();
+    fixture.conflict();
+    let original = fs::read(fixture.repo.root.join("file")).unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('1'));
+    key(&mut app, KeyCode::Char('e'));
+    assert!(matches!(app.modal, Some(app::Modal::Inline { .. })));
+    app.handle_paste("manual ");
+    render_views(&app);
+    app.auto_refresh(Instant::now() + Duration::from_secs(3));
+    assert!(
+        !app.loading(),
+        "automatic refresh must not run over an editor draft"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        app.modal,
+        Some(app::Modal::Confirm {
+            task: app::Task::SaveConflict(_),
+            ..
+        })
+    ));
+    assert_eq!(fs::read(fixture.repo.root.join("file")).unwrap(), original);
+    key(&mut app, KeyCode::Char('n'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Conflict(conflict)) if conflict.dirty() && conflict.result() == "manual current\n")
+    );
+    key(&mut app, KeyCode::Char('u'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Conflict(conflict)) if conflict.result() == "current\n")
+    );
+    key(&mut app, KeyCode::Char('s'));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("file")).unwrap(),
+        "current\n"
+    );
+    assert!(!fixture.repo.bytes(&["ls-files", "-u"]).unwrap().is_empty());
+    key(&mut app, KeyCode::Char('a'));
+    wait(&mut app);
+    assert!(fixture.repo.bytes(&["ls-files", "-u"]).unwrap().is_empty());
+    key(&mut app, KeyCode::Char('C'));
+    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
+    key(&mut app, KeyCode::Char('n'));
+    assert_eq!(fixture.repo.operation().unwrap(), Some(Operation::Merge));
+    key(&mut app, KeyCode::Char('C'));
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert_eq!(fixture.repo.operation().unwrap(), None);
+}
+
+#[test]
+fn manually_resolved_or_malformed_drafts_remain_undoable_and_safe() {
+    let fixture = Fixture::new();
+    fixture.conflict();
+    let snapshot = fixture.repo.snapshot().unwrap();
+    let mut conflict = Conflict::load(
+        &fixture.repo,
+        "file".into(),
+        snapshot.guard,
+        &snapshot.branch,
+    )
+    .unwrap();
+    conflict
+        .edit_result("manual without final newline".into())
+        .unwrap();
+    assert_eq!(conflict.regions().len(), 0);
+    assert_eq!(conflict.unresolved(), 0);
+    conflict.choose(Choice::Incoming); // no regions must be a safe no-op
+    assert_eq!(conflict.result(), "manual without final newline");
+    conflict.edit_result("<<<<<<< unfinished\n".into()).unwrap();
+    assert!(conflict.parse_error.is_some() && conflict.unresolved() > 0);
+    conflict.undo();
+    assert_eq!(conflict.result(), "manual without final newline");
+    conflict.undo();
+    assert_eq!(conflict.unresolved(), 1);
+}
+
+#[test]
+fn confirmed_save_rechecks_external_edits_and_retains_the_draft_on_failure() {
+    let fixture = Fixture::new();
+    fixture.conflict();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('1'));
+    key(&mut app, KeyCode::Char('s'));
+    assert!(matches!(
+        app.modal,
+        Some(app::Modal::Confirm {
+            task: app::Task::SaveConflict(_),
+            ..
+        })
+    ));
+    fixture.write("file", "external editor content\n");
+    key(&mut app, KeyCode::Char('y'));
+    wait(&mut app);
+    assert!(app.error.is_some());
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Conflict(conflict)) if conflict.dirty() && conflict.result() == "current\n")
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("file")).unwrap(),
+        "external editor content\n"
+    );
+}
+
+#[test]
+fn merge_commit_file_browser_can_compare_both_parents() {
+    let fixture = Fixture::new();
+    fixture.base();
+    fixture.success(&["switch", "-c", "side"]);
+    fixture.commit("side", "side\n", "side");
+    fixture.success(&["switch", "main"]);
+    fixture.commit("main", "main\n", "main");
+    fixture.success(&["merge", "--no-ff", "--no-edit", "side"]);
+    let first = fixture.repo.commit_files("HEAD", 0).unwrap();
+    let second = fixture.repo.commit_files("HEAD", 1).unwrap();
+    assert_eq!(first.parents.len(), 2);
+    assert_eq!(first.files[0].path, Path::new("side"));
+    assert_eq!(second.files[0].path, Path::new("main"));
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('P'));
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.commit.parent == 1 && view.preview.contains("+main"))
+    );
+}
+
+#[test]
+fn historical_files_cover_root_rename_deletion_and_literal_paths() {
+    let fixture = Fixture::new();
+    fixture.write("alpha", &"line\n".repeat(20));
+    fixture.write("deleted", "old content\n");
+    let root = fixture.commit(":(glob)*.rs", "literal content\n", "root");
+    let first = fixture.repo.commit_files(&root, 0).unwrap();
+    assert!(first.parents.is_empty());
+    assert_eq!(first.files.len(), 3);
+    let literal = first
+        .files
+        .iter()
+        .position(|file| file.path == Path::new(":(glob)*.rs"))
+        .unwrap();
+    let diff = fixture
+        .repo
+        .historical_preview(&first, literal, false)
+        .unwrap();
+    assert!(diff.contains("+literal content") && !diff.contains("old content"));
+    fixture.repo.bytes(&["mv", "alpha", "renamed"]).unwrap();
+    fixture.repo.bytes(&["rm", "deleted"]).unwrap();
+    fixture
+        .repo
+        .bytes(&["commit", "-m", "rename and delete"])
+        .unwrap();
+    let commit = fixture.repo.commit_files("HEAD", 0).unwrap();
+    let before = fixture.repo.guard().unwrap();
+    let renamed = commit
+        .files
+        .iter()
+        .position(|file| file.path == Path::new("renamed"))
+        .unwrap();
+    assert_eq!(
+        commit.files[renamed].original.as_deref(),
+        Some(Path::new("alpha"))
+    );
+    assert!(
+        fixture
+            .repo
+            .historical_preview(&commit, renamed, false)
+            .unwrap()
+            .contains("rename from alpha")
+    );
+    let deleted = commit
+        .files
+        .iter()
+        .position(|file| file.status == "D")
+        .unwrap();
+    assert_eq!(
+        fixture
+            .repo
+            .historical_preview(&commit, deleted, true)
+            .unwrap(),
+        "old content\n"
+    );
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
+fn history_enter_drills_into_files_and_full_content_without_checkout() {
+    let fixture = Fixture::new();
+    fixture.write("a", "alpha\n");
+    fixture.commit("b", "beta\n", "root");
+    let before = fixture.repo.guard().unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.commit.files.len() == 2 && view.preview.contains("+alpha"))
+    );
+    key(&mut app, KeyCode::Char('j'));
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.selected == 1 && view.preview.contains("+beta") && !view.preview.contains("+alpha"))
+    );
+    key(&mut app, KeyCode::Char('t'));
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.full && view.preview == "beta\n")
+    );
+    render_views(&app);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Down);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.focus == app::Focus::Preview && view.scroll == 0)
+    );
+    key(&mut app, KeyCode::Esc);
+    wait(&mut app);
+    assert!(app.modal.is_none() && app.workspace == app::Workspace::History);
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
+fn historical_full_file_navigation_can_reach_beyond_u16_line_offsets() {
+    let fixture = Fixture::new();
+    fixture.commit("many-lines", &"x\n".repeat(70_000), "many lines");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('t'));
+    wait(&mut app);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::End);
+    assert!(matches!(&app.modal, Some(app::Modal::Commit(view)) if view.scroll == 69_999));
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(screen.contains("70000 x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn quick_installer_selects_platform_verifies_checksums_and_refuses_silent_overwrite() {
+    use std::os::unix::fs::PermissionsExt;
+    for (os, arch, target) in [
+        ("Darwin", "arm64", "aarch64-apple-darwin"),
+        ("Linux", "x86_64", "x86_64-unknown-linux-musl"),
+        ("Linux", "aarch64", "aarch64-unknown-linux-musl"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mock = root.join("mock");
+        fs::create_dir(&mock).unwrap();
+        let package = root.join("package");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("kae"), "verified test payload\n").unwrap();
+        let archive = root.join("archive.tar.gz");
+        assert!(
+            Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&package)
+                .arg("kae")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let digest = Command::new("sh").arg("-c").arg("if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi").arg("checksum").arg(&archive).output().unwrap();
+        assert!(digest.status.success());
+        let hash = String::from_utf8(digest.stdout)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned();
+        fs::write(
+            root.join("checksum"),
+            format!("{hash}  kae-{target}.tar.gz\n"),
+        )
+        .unwrap();
+        fs::write(mock.join("uname"), "#!/bin/sh\ncase $1 in -s) echo \"$TEST_OS\";; -m) echo \"$TEST_ARCH\";; *) exit 1;; esac\n").unwrap();
+        fs::write(mock.join("curl"), "#!/bin/sh\nset -eu\nurl=\noutput=\nwhile [ \"$#\" -gt 0 ]; do\ncase $1 in -o) output=$2; shift 2;; https://*) url=$1; shift;; *) shift;; esac\ndone\nprintf '%s\\n' \"$url\" >> \"$TEST_ROOT/urls\"\ncase $url in *.sha256) cp \"$TEST_ROOT/checksum\" \"$output\";; *.tar.gz) cp \"$TEST_ROOT/archive.tar.gz\" \"$output\";; *) exit 1;; esac\n").unwrap();
+        for name in ["uname", "curl"] {
+            fs::set_permissions(mock.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let temp = root.join("tmp");
+        fs::create_dir(&temp).unwrap();
+        let install = root.join("install with spaces");
+        let run = || {
+            Command::new("sh")
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/install.sh"))
+                .arg("v0.1.0")
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        mock.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("TEST_ROOT", root)
+                .env("TEST_OS", os)
+                .env("TEST_ARCH", arch)
+                .env("KAE_INSTALL_DIR", &install)
+                .env("KAE_NONINTERACTIVE", "1")
+                .env("TMPDIR", &temp)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(install.join("kae")).unwrap(),
+            "verified test payload\n"
+        );
+        assert!(
+            fs::read_to_string(root.join("urls"))
+                .unwrap()
+                .contains(&format!("/download/v0.1.0/kae-{target}.tar.gz"))
+        );
+        assert_eq!(
+            fs::read_dir(&temp).unwrap().count(),
+            0,
+            "installer leaked temporary files"
+        );
+        fs::write(install.join("kae"), "keep existing binary\n").unwrap();
+        assert!(!run().status.success());
+        assert_eq!(
+            fs::read_to_string(install.join("kae")).unwrap(),
+            "keep existing binary\n"
+        );
+        fs::remove_file(install.join("kae")).unwrap();
+        fs::write(
+            root.join("checksum"),
+            format!("{}  kae-{target}.tar.gz\n", "0".repeat(64)),
+        )
+        .unwrap();
+        let output = run();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Checksum mismatch"));
+        assert!(!install.join("kae").exists());
+        assert_eq!(fs::read_dir(&temp).unwrap().count(), 0);
+    }
 }

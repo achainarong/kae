@@ -3,6 +3,7 @@ mod conflict;
 mod editor;
 mod git;
 mod graph;
+mod loader;
 mod rebase;
 mod ui;
 
@@ -40,7 +41,7 @@ fn main() -> Result<()> {
         bail!("Kae needs an interactive terminal. Run `kae --help` for usage.");
     }
 
-    // Discover the repository before entering raw mode so errors remain readable.
+    // Repository discovery and reads happen in the loader after the first frame.
     let mut app = App::new(&cli.path)?;
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
