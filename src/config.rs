@@ -1,4 +1,4 @@
-//! User configuration. Loading is read-only; only an accepted theme choice saves.
+//! User configuration. Loading is read-only; explicit theme/layout choices save.
 use crate::theme::{PRESETS, Theme};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use std::{
 pub struct Config {
     pub theme: String,
     pub transparent: bool,
+    pub panes: Panes,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -21,7 +22,32 @@ impl Default for Config {
         Self {
             theme: "catppuccin-mocha".into(),
             transparent: true,
+            panes: Panes::default(),
             extra: toml::Table::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Panes {
+    pub files_width: u16,
+    pub history_width: u16,
+    pub commit_width: u16,
+    pub files_height: u16,
+    pub history_height: u16,
+    pub commit_height: u16,
+}
+
+impl Default for Panes {
+    fn default() -> Self {
+        Self {
+            files_width: 32,
+            history_width: 50,
+            commit_width: 32,
+            files_height: 32,
+            history_height: 50,
+            commit_height: 32,
         }
     }
 }
@@ -121,6 +147,25 @@ impl Config {
         names
     }
     pub fn save_theme(root: &Path, name: &str) -> Result<()> {
+        Self::save(root, |document| document["theme"] = toml_edit::value(name))
+    }
+
+    pub fn save_panes(root: &Path, panes: &Panes) -> Result<()> {
+        Self::save(root, |document| {
+            for (name, value) in [
+                ("files_width", panes.files_width),
+                ("history_width", panes.history_width),
+                ("commit_width", panes.commit_width),
+                ("files_height", panes.files_height),
+                ("history_height", panes.history_height),
+                ("commit_height", panes.commit_height),
+            ] {
+                document["panes"][name] = toml_edit::value(i64::from(value.clamp(15, 85)));
+            }
+        })
+    }
+
+    fn save(root: &Path, update: impl FnOnce(&mut toml_edit::DocumentMut)) -> Result<()> {
         // Re-read before saving, preserving unrelated settings and comments.
         let path = root.join("config.toml");
         let mut document: toml_edit::DocumentMut = match fs::read_to_string(&path) {
@@ -134,7 +179,7 @@ impl Config {
             }
             Err(error) => return Err(error.into()),
         };
-        document["theme"] = toml_edit::value(name);
+        update(&mut document);
         fs::create_dir_all(root)?;
         let mut temp = tempfile::NamedTempFile::new_in(root)?;
         if let Ok(metadata) = fs::metadata(&path) {
@@ -150,6 +195,47 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pane_sizes_round_trip_preserve_comments_and_reject_invalid_configs() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("config.toml"),
+            "# keep comment\ntheme = 'nord'\n[other]\nvalue = 42\n[panes]\ncustom = 'keep'\n",
+        )
+        .unwrap();
+        let panes = Panes {
+            files_width: 44,
+            history_width: 60,
+            commit_width: 0,
+            history_height: 1000,
+            ..Panes::default()
+        };
+        Config::save_panes(root.path(), &panes).unwrap();
+        let config = Config::load(root.path()).unwrap();
+        assert_eq!(config.panes.files_width, 44);
+        assert_eq!(config.panes.history_width, 60);
+        assert_eq!(config.panes.commit_width, 15);
+        assert_eq!(config.panes.history_height, 85);
+        Config::save_theme(root.path(), "terminal").unwrap();
+        assert_eq!(Config::load(root.path()).unwrap().panes.files_width, 44);
+        let text = fs::read_to_string(root.path().join("config.toml")).unwrap();
+        assert!(
+            text.contains("# keep comment")
+                && text.contains("42")
+                && text.contains("custom = 'keep'")
+        );
+        fs::write(
+            root.path().join("config.toml"),
+            "[panes]\nfiles_width = 'invalid'\n",
+        )
+        .unwrap();
+        assert!(Config::save_panes(root.path(), &panes).is_err());
+        assert!(
+            fs::read_to_string(root.path().join("config.toml"))
+                .unwrap()
+                .contains("'invalid'")
+        );
+    }
     #[test]
     fn terminal_background_is_the_default_and_opaque_is_explicit() {
         use ratatui::style::Color;

@@ -2,3 +2,12 @@
 theme = "catppuccin-mocha"
 # Inherit your terminal background and opacity. Set false for a solid theme background.
 transparent = true
+
+# Pane proportions (percent); adjusted by dragging or Ctrl + arrow keys.
+[panes]
+files_width = 32
+history_width = 50
+commit_width = 32
+files_height = 32
+history_height = 50
+commit_height = 32

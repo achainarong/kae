@@ -34,12 +34,15 @@ struct Directory {
     files: BTreeMap<OsString, usize>,
 }
 
+#[derive(Clone)]
 pub struct FileTree {
     all: Vec<TreeRow>,
     pub rows: Vec<TreeRow>,
     pub cursor: usize,
     pub collapsed: HashSet<PathBuf>,
     order: Vec<usize>,
+    pub filter: String,
+    saved_collapsed: Option<HashSet<PathBuf>>,
 }
 
 impl FileTree {
@@ -140,6 +143,8 @@ impl FileTree {
             cursor: 0,
             collapsed: HashSet::new(),
             order,
+            filter: String::new(),
+            saved_collapsed: None,
         };
         if let Some(first) = tree.order.first().copied() {
             tree.select_file(first);
@@ -149,8 +154,31 @@ impl FileTree {
 
     fn rebuild(&mut self, selected: Option<(PathBuf, bool)>) {
         self.rows.clear();
+        let query = self.filter.to_lowercase();
+        let mut matching = HashSet::new();
+        if !query.is_empty() {
+            let mut ancestors: Vec<&TreeRow> = Vec::new();
+            for row in &self.all {
+                while ancestors
+                    .last()
+                    .is_some_and(|parent| parent.depth >= row.depth)
+                {
+                    ancestors.pop();
+                }
+                if row.path.to_string_lossy().to_lowercase().contains(&query) {
+                    matching.insert((row.path.clone(), row.file.is_none()));
+                    matching.extend(ancestors.iter().map(|parent| (parent.path.clone(), true)));
+                }
+                if row.file.is_none() {
+                    ancestors.push(row);
+                }
+            }
+        }
         let mut hidden_depth = None;
         for row in &self.all {
+            if !query.is_empty() && !matching.contains(&(row.path.clone(), row.file.is_none())) {
+                continue;
+            }
             if let Some(depth) = hidden_depth {
                 if row.depth > depth {
                     continue;
@@ -173,6 +201,107 @@ impl FileTree {
 
     pub fn selected(&self) -> Option<&TreeRow> {
         self.rows.get(self.cursor)
+    }
+
+    pub fn with_directories(mut self, directories: &[PathBuf]) -> Self {
+        // These are independent roots (remote names), even when a name has '/'.
+        fn owner<'a>(row: &TreeRow, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
+            roots
+                .iter()
+                .filter(|root| {
+                    row.path.starts_with(root) && (row.file.is_none() || row.path != **root)
+                })
+                .max_by_key(|root| root.components().count())
+        }
+        for path in directories {
+            if !self
+                .all
+                .iter()
+                .any(|row| row.path == *path && row.file.is_none())
+            {
+                self.all.push(TreeRow {
+                    path: path.clone(),
+                    name: path.file_name().unwrap_or(path.as_os_str()).into(),
+                    depth: path.components().count().saturating_sub(1),
+                    file: None,
+                    count: 0,
+                });
+            }
+        }
+        self.all.retain(|row| owner(row, directories).is_some());
+        let mut counts = HashMap::new();
+        for row in &self.all {
+            if row.file.is_some()
+                && let Some(root) = owner(row, directories)
+            {
+                for parent in row
+                    .path
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|parent| parent.starts_with(root))
+                {
+                    *counts
+                        .entry((root.clone(), parent.to_path_buf()))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        for row in &mut self.all {
+            if let Some(root) = owner(row, directories) {
+                row.depth = row
+                    .path
+                    .strip_prefix(root)
+                    .expect("root prefix")
+                    .components()
+                    .count();
+                if row.path == *root {
+                    row.name = root.as_os_str().to_owned();
+                }
+                if row.file.is_none() {
+                    row.count = counts
+                        .get(&(root.clone(), row.path.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                }
+            }
+        }
+        self.all.sort_by(|left, right| {
+            owner(left, directories)
+                .cmp(&owner(right, directories))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        self.rebuild(None);
+        self
+    }
+
+    pub fn set_filter(&mut self, query: &str) {
+        if self.filter == query {
+            return;
+        }
+        let selected = self
+            .selected()
+            .map(|row| (row.path.clone(), row.file.is_none()));
+        if !query.is_empty() {
+            if self.saved_collapsed.is_none() {
+                self.saved_collapsed = Some(self.collapsed.clone());
+            }
+            self.collapsed.clear();
+        } else if let Some(saved) = self.saved_collapsed.take() {
+            self.collapsed = saved;
+        }
+        self.filter = query.into();
+        self.rebuild(selected);
+    }
+
+    pub fn restore_view(&mut self, previous: &Self) {
+        self.filter = previous.filter.clone();
+        self.collapsed = previous.collapsed.clone();
+        self.saved_collapsed = previous.saved_collapsed.clone();
+        self.rebuild(
+            previous
+                .selected()
+                .map(|row| (row.path.clone(), row.file.is_none())),
+        );
     }
 
     pub fn navigate(&mut self, delta: isize) -> Option<usize> {
@@ -704,6 +833,37 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filtering_reveals_matches_with_ancestors_and_restores_collapsed_state() {
+        let mut tree = FileTree::new(&[
+            file("src/alpha.rs"),
+            file("src/nested/雪.rs"),
+            file("other/beta.rs"),
+        ]);
+        tree.select_file(1);
+        tree.collapse();
+        tree.collapse();
+        tree.collapse();
+        let collapsed = tree.collapsed.clone();
+        tree.set_filter("雪");
+        assert!(
+            tree.rows
+                .iter()
+                .any(|row| row.path == Path::new("src/nested/雪.rs"))
+        );
+        assert!(tree.rows.iter().any(|row| row.path == Path::new("src")));
+        assert!(!tree.rows.iter().any(|row| row.path == Path::new("other")));
+        let mut refreshed = FileTree::new(&[
+            file("src/alpha.rs"),
+            file("src/nested/雪.rs"),
+            file("other/beta.rs"),
+        ]);
+        refreshed.restore_view(&tree);
+        refreshed.set_filter("");
+        assert_eq!(refreshed.collapsed, collapsed);
+        tree.set_filter("no match");
+        assert!(tree.rows.is_empty());
+    }
     fn file(path: impl Into<PathBuf>) -> CommittedFile {
         CommittedFile {
             path: path.into(),

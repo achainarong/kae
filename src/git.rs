@@ -130,7 +130,15 @@ pub struct Guard {
 }
 
 #[derive(Clone, Debug)]
+pub struct RemoteBranch {
+    pub remote: String,
+    pub branch: String,
+    pub oid: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct Snapshot {
+    pub all_history: bool,
     pub branch: String,
     pub head: Option<String>,
     pub operation: Option<Operation>,
@@ -138,6 +146,7 @@ pub struct Snapshot {
     pub commits: Vec<Commit>,
     pub branches: Vec<Branch>,
     pub remotes: Vec<String>,
+    pub remote_branches: Vec<RemoteBranch>,
     pub stashes: Vec<Stash>,
     pub tags: Vec<String>,
     pub worktrees: Vec<Worktree>,
@@ -147,6 +156,7 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn loading() -> Self {
         Self {
+            all_history: false,
             branch: "Loading…".into(),
             head: None,
             operation: None,
@@ -154,6 +164,7 @@ impl Snapshot {
             commits: Vec::new(),
             branches: Vec::new(),
             remotes: Vec::new(),
+            remote_branches: Vec::new(),
             stashes: Vec::new(),
             tags: Vec::new(),
             worktrees: Vec::new(),
@@ -578,8 +589,12 @@ impl Repo {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_scoped(true)
+    }
+
+    pub fn snapshot_scoped(&self, all_history: bool) -> Result<Snapshot> {
         let guard = self.guard()?;
-        self.snapshot_with_guard(guard)
+        self.snapshot_with_guard(guard, all_history)
     }
 
     /// Index updates cannot change history. Reuse it only after a fresh, full
@@ -594,7 +609,7 @@ impl Repo {
             || guard.refs != old.refs
             || guard.remote_config != old.remote_config
         {
-            return self.snapshot_with_guard(guard);
+            return self.snapshot_with_guard(guard, previous.all_history);
         }
         let mut snapshot = previous.clone();
         snapshot.files = parse_status(&guard.status)?;
@@ -602,7 +617,7 @@ impl Repo {
         Ok(snapshot)
     }
 
-    fn snapshot_with_guard(&self, guard: Guard) -> Result<Snapshot> {
+    fn snapshot_with_guard(&self, guard: Guard, all_history: bool) -> Result<Snapshot> {
         let files = parse_status(&guard.status)?;
         let branch = self
             .text(&["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -624,20 +639,19 @@ impl Repo {
             ensure!(fields.len() == 5, "Malformed branch record");
             branches.push(Branch { name: fields[0].into(), oid: fields[1].into(), upstream: fields[2].into(), tracking: fields[3].into(), current: fields[4] == "*" });
         }
-        let mut log_args = vec![
-            "log",
-            "--graph",
-            "--date-order",
-            "--max-count=300",
-            "--branches",
-            "--remotes",
-            "--tags",
-        ];
+        let mut log_args = vec!["log", "--graph", "--date-order", "--max-count=300"];
+        if all_history {
+            log_args.extend(["--branches", "--remotes", "--tags"]);
+        }
         if guard.head.is_some() {
             log_args.push("HEAD");
         }
         log_args.extend(["--format=%x1e%H%x00%h%x00%d%x00%s%x00%an%x00%ar", "--"]);
-        let commits = graph::parse(&self.bytes(&log_args)?)?;
+        let commits = if !all_history && guard.head.is_none() {
+            Vec::new()
+        } else {
+            graph::parse(&self.bytes(&log_args)?)?
+        };
         let stashes = self
             .text(&["stash", "list", "--format=%gd%x00%H%x00%gs"])?
             .lines()
@@ -651,7 +665,43 @@ impl Repo {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let remotes = self
+            .text(&["remote"])?
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut remote_branches = Vec::new();
+        for record in self
+            .text(&[
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(refname)%00%(objectname)%00%(symref)",
+                "refs/remotes",
+            ])?
+            .lines()
+        {
+            let fields = record.split('\0').collect::<Vec<_>>();
+            ensure!(fields.len() == 3, "Malformed remote branch record");
+            if !fields[2].is_empty() {
+                continue;
+            }
+            let Some(name) = fields[0].strip_prefix("refs/remotes/") else {
+                continue;
+            };
+            if let Some(remote) = remotes
+                .iter()
+                .filter(|remote| name.starts_with(&format!("{remote}/")))
+                .max_by_key(|remote| remote.len())
+            {
+                remote_branches.push(RemoteBranch {
+                    remote: remote.clone(),
+                    branch: name[remote.len() + 1..].into(),
+                    oid: fields[1].into(),
+                });
+            }
+        }
         Ok(Snapshot {
+            all_history,
             branch,
             head: guard.head.clone(),
             operation: guard.operation,
@@ -659,7 +709,8 @@ impl Repo {
             commits,
             branches,
             stashes,
-            remotes: self.text(&["remote"])?.lines().map(str::to_owned).collect(),
+            remotes,
+            remote_branches,
             tags: self
                 .text(&["tag", "--list", "--sort=-creatordate"])?
                 .lines()

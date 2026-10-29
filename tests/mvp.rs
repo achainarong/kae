@@ -1096,6 +1096,906 @@ fn ui_stage_commit_and_destructive_confirmation_flow() {
 }
 
 #[test]
+fn history_defaults_to_compact_head_scope_and_retains_toggles_and_selection() {
+    let fixture = Fixture::new();
+    let base = fixture.base();
+    fixture.success(&["switch", "-c", "side"]);
+    let side = fixture.commit("side-file", "side\n", "side-only commit");
+    fixture.success(&["switch", "main"]);
+    let main = fixture.commit("main-file", "main\n", "main-only commit");
+    let before = fixture.repo.guard().unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('2'));
+    wait(&mut app);
+    assert!(!app.history_graph && !app.snapshot.all_history);
+    assert_eq!(app.snapshot.commits.len(), 2);
+    assert!(app.snapshot.commits.iter().all(|commit| commit.oid != side));
+    assert!(app.items().iter().all(|item| !item.contains('\n')));
+    assert!(app.items()[0].starts_with("main-only commit"));
+    let selected = app.snapshot.commits[app.selected].oid.clone();
+    key(&mut app, KeyCode::Char('g'));
+    assert!(app.history_graph);
+    assert!(app.items()[0].starts_with('*'));
+    assert_eq!(app.snapshot.commits[app.selected].oid, selected);
+    key(&mut app, KeyCode::Char('B'));
+    wait(&mut app);
+    assert!(app.snapshot.all_history);
+    assert_eq!(app.snapshot.commits.len(), 3);
+    assert_eq!(app.snapshot.commits[app.selected].oid, selected);
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert!(app.history_graph && app.snapshot.all_history);
+    // Rapid scope changes must accept only the final reader generation.
+    key(&mut app, KeyCode::Char('B'));
+    key(&mut app, KeyCode::Char('B'));
+    key(&mut app, KeyCode::Char('B'));
+    wait(&mut app);
+    assert!(!app.snapshot.all_history);
+    fixture.repo.verify(&before).unwrap();
+    fixture.success(&["switch", "--detach", &base]);
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert_eq!(app.snapshot.commits.len(), 1);
+    assert_eq!(app.snapshot.commits[0].oid, base);
+    fixture.success(&["switch", "--orphan", "empty"]);
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert!(app.snapshot.commits.is_empty());
+    key(&mut app, KeyCode::Char('B'));
+    wait(&mut app);
+    assert!(app.snapshot.commits.iter().any(|commit| commit.oid == main));
+    assert!(app.snapshot.commits.iter().any(|commit| commit.oid == side));
+}
+
+fn draw_at(
+    app: &app::App,
+    width: u16,
+    height: u16,
+) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+    terminal
+}
+
+#[test]
+fn parent_and_file_previews_follow_selection_without_changing_expansion() {
+    use crossterm::event::{MouseButton::Left, MouseEventKind::Down};
+    let fixture = Fixture::new();
+    fixture.write("src/a", "base a\n");
+    fixture.write("src/nested/b", "base b\n");
+    fixture.commit("outside", "base\n", "base");
+    fixture.write("src/a", "staged a\n");
+    fixture.success(&["add", "src/a"]);
+    fixture.write("src/a", "working a\n");
+    fixture.write("src/nested/b", "working b\n");
+    fixture.write("src/new", "untracked content\n");
+    fixture.write("outside", "outside change\n");
+    let before = fixture.repo.guard().unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    select_folder(&mut app, "src");
+    draw_at(&app, 140, 40);
+    let geometry = app.geometry.borrow().clone();
+    let line = geometry
+        .rows
+        .iter()
+        .position(|row| *row == app.explorer.cursor)
+        .unwrap() as u16;
+    let collapsed = app.explorer.collapsed.clone();
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 10,
+        geometry.list.y + 1 + line,
+    );
+    wait(&mut app);
+    assert_eq!(app.explorer.collapsed, collapsed);
+    for content in [
+        "STAGED",
+        "WORKING TREE",
+        "+staged a",
+        "+working a",
+        "+working b",
+        "untracked content",
+    ] {
+        assert!(app.preview.contains(content), "{content}");
+    }
+    assert!(!app.preview.contains("outside change"));
+    key(&mut app, KeyCode::Home);
+    wait(&mut app);
+    assert!(app.preview.contains("outside change"));
+    draw_at(&app, 140, 40);
+    let target = app
+        .explorer
+        .rows
+        .iter()
+        .position(|row| row.path == Path::new("src/nested/b"))
+        .unwrap();
+    let geometry = app.geometry.borrow().clone();
+    let line = geometry.rows.iter().position(|row| *row == target).unwrap() as u16;
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 12,
+        geometry.list.y + 1 + line,
+    );
+    wait(&mut app);
+    assert!(app.preview.contains("+working b"));
+    assert!(!app.preview.contains("staged a") && !app.preview.contains("outside change"));
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
+fn combined_folder_preview_is_bounded_and_utf8_safe() {
+    let fixture = Fixture::new();
+    fixture.write("src/a", &"雪".repeat(100_000));
+    fixture.write("src/b", "later file\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Home);
+    wait(&mut app);
+    assert!(app.preview.contains("Combined preview truncated"));
+    assert!(app.preview.len() <= git::PREVIEW_LIMIT + 100);
+}
+
+#[test]
+fn slash_filters_lists_searches_diffs_and_never_executes_commands() {
+    let fixture = Fixture::new();
+    fixture.commit("alpha", "first needle\nsecond needle\n", "wanted commit");
+    fixture.commit("beta", "other\n", "another commit");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Char('/'));
+    assert!(app.modal.is_none());
+    app.handle_paste("wanted");
+    assert_eq!(app.visible_items().len(), 1);
+    assert_eq!(app.selected, 1);
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    assert!(app.modal.is_none() && app.preview.contains("wanted commit"));
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("needle");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.preview_search.matches.len(), 2);
+    let first = app.preview_search.active;
+    key(&mut app, KeyCode::Char('n'));
+    assert_ne!(app.preview_search.active, first);
+    let terminal = draw_at(&app, 140, 40);
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.bg == app.theme.search_active)
+    );
+    key(&mut app, KeyCode::Esc);
+    assert!(
+        app.filters[app::Workspace::History.index()]
+            .query
+            .is_empty()
+    );
+    key(&mut app, KeyCode::Char(':'));
+    assert!(matches!(app.modal, Some(app::Modal::Palette { .. })));
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Char('3'));
+    let before = fixture.repo.guard().unwrap();
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("no matching branch qsy");
+    key(&mut app, KeyCode::Enter);
+    assert!(app.visible_items().is_empty());
+    key(&mut app, KeyCode::Enter);
+    assert!(app.busy.is_none());
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
+fn file_filter_restores_expansion_after_refresh_and_clear() {
+    let fixture = Fixture::new();
+    fixture.write("src/alpha", "alpha\n");
+    fixture.write("src/nested/雪", "target\n");
+    fixture.write("outside", "other\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    select_folder(&mut app, "src");
+    key(&mut app, KeyCode::Enter);
+    let collapsed = app.explorer.collapsed.clone();
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("雪");
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    assert!(
+        app.explorer
+            .rows
+            .iter()
+            .any(|row| row.path == Path::new("src/nested/雪"))
+    );
+    assert!(
+        !app.explorer
+            .rows
+            .iter()
+            .any(|row| row.path == Path::new("outside"))
+    );
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert_eq!(app.explorer.filter, "雪");
+    key(&mut app, KeyCode::Esc);
+    wait(&mut app);
+    assert_eq!(app.explorer.collapsed, collapsed);
+}
+
+#[test]
+fn remote_tree_groups_filters_and_targets_network_confirmations_without_local_diffs() {
+    use crossterm::event::{MouseButton::Left, MouseEventKind::Down};
+    let fixture = Fixture::new();
+    let base = fixture.base();
+    for remote in ["origin", "upstream", "empty"] {
+        fixture.success(&["remote", "add", remote, &format!("/not/contacted/{remote}")]);
+    }
+    for reference in [
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/feature/card",
+        "refs/remotes/upstream/main",
+        "refs/remotes/upstream/release/v2",
+    ] {
+        fixture.success(&["update-ref", reference, &base]);
+    }
+    fixture.success(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    fixture.write("local-only-change", "never show me in remote view\n");
+    let before = fixture.repo.guard().unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('4'));
+    wait(&mut app);
+    assert_eq!(app.snapshot.remote_branches.len(), 4);
+    assert!(
+        app.remote_tree
+            .rows
+            .iter()
+            .any(|row| row.path == Path::new("empty") && row.count == 0)
+    );
+    let root = app
+        .remote_tree
+        .rows
+        .iter()
+        .position(|row| row.path == Path::new("origin"))
+        .unwrap();
+    draw_at(&app, 140, 40);
+    let geometry = app.geometry.borrow().clone();
+    let line = geometry.rows.iter().position(|row| *row == root).unwrap() as u16;
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 10,
+        geometry.list.y + 1 + line,
+    );
+    wait(&mut app);
+    assert!(app.preview.contains("Remote: origin") && app.preview.contains("origin/feature/card"));
+    assert!(!app.preview.contains("local-only-change"));
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 3,
+        geometry.list.y + 1 + line,
+    );
+    assert!(app.remote_tree.collapsed.contains(Path::new("origin")));
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert!(app.remote_tree.collapsed.contains(Path::new("origin")));
+    key(&mut app, KeyCode::Right);
+    assert!(!app.remote_tree.collapsed.contains(Path::new("origin")));
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("upstream/release/v2");
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    assert!(
+        app.remote_tree
+            .rows
+            .iter()
+            .all(|row| row.path.starts_with("upstream"))
+    );
+    draw_at(&app, 140, 40);
+    let geometry = app.geometry.borrow().clone();
+    let target = app
+        .remote_tree
+        .rows
+        .iter()
+        .position(|row| row.file.is_some())
+        .unwrap();
+    let line = geometry.rows.iter().position(|row| *row == target).unwrap() as u16;
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 12,
+        geometry.list.y + 1 + line,
+    );
+    wait(&mut app);
+    assert!(
+        app.preview.contains("Remote: upstream")
+            && app.preview.contains("Branch: release/v2")
+            && app.preview.contains("Compared with current HEAD")
+    );
+    key(&mut app, KeyCode::Char('f'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Confirm { task: app::Task::Git(action), .. }) if action.args.last().is_some_and(|arg| arg == "upstream"))
+    );
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Char('p'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Confirm { task: app::Task::Git(action), detail }) if action.args.last().is_some_and(|arg| arg == "release/v2") && detail.contains("upstream/release/v2"))
+    );
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Char('P'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Confirm { task: app::Task::Git(action), detail }) if action.args.last().is_some_and(|arg| arg == "HEAD:refs/heads/release/v2") && detail.contains("upstream"))
+    );
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
+fn tabs_are_clickable_and_commit_tree_slash_filters_instead_of_searching_the_diff() {
+    use crossterm::event::{MouseButton::Left, MouseEventKind::Down};
+    let fixture = navigation_fixture();
+    let before = fixture.repo.guard().unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    draw_at(&app, 140, 40);
+    let (area, _) = app
+        .tab_hits
+        .borrow()
+        .iter()
+        .find(|(_, workspace)| *workspace == app::Workspace::History)
+        .copied()
+        .unwrap();
+    mouse(&mut app, Down(Left), area.x + 2, area.y);
+    assert_eq!(app.workspace, app::Workspace::History);
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('/'));
+    app.handle_paste("a.rs");
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.tree.filter == "a.rs" && view.history.tree.rows.iter().filter(|row| row.file.is_some()).count() == 1 && view.history.search.query.is_empty())
+    );
+    key(&mut app, KeyCode::Esc);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.tree.filter.is_empty())
+    );
+    fixture.repo.verify(&before).unwrap();
+}
+
+fn mouse(app: &mut app::App, kind: crossterm::event::MouseEventKind, x: u16, y: u16) {
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+}
+
+#[test]
+fn clicks_select_scrolled_files_commits_and_graph_connector_rows_without_writes() {
+    use crossterm::event::{MouseButton::Left, MouseEventKind::Down};
+    let fixture = Fixture::new();
+    for index in 0..35 {
+        fixture.write(&format!("src/{index:02}.txt"), "content\n");
+    }
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    for _ in 0..30 {
+        key(&mut app, KeyCode::Down);
+    }
+    draw_at(&app, 140, 20);
+    let geometry = app.geometry.borrow().clone();
+    let row = geometry.rows[0];
+    assert!(row > 0);
+    let expected = app.explorer.rows[row].file.unwrap();
+    let before = fixture.repo.guard().unwrap();
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 5,
+        geometry.list.y + 1,
+    );
+    assert_eq!(app.selected, expected);
+    wait(&mut app);
+    assert!(app.preview.contains("content"));
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.preview.x + 3,
+        geometry.preview.y + 3,
+    );
+    assert_eq!(app.focus, app::Focus::Preview);
+    fixture.repo.verify(&before).unwrap();
+    // Clicking a folder expands/collapses, but never stages it.
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Home);
+    draw_at(&app, 140, 30);
+    let geometry = app.geometry.borrow().clone();
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 5,
+        geometry.list.y + 2,
+    );
+    assert!(app.explorer.collapsed.contains(Path::new("src")));
+    assert!(app.busy.is_none());
+    fixture.repo.verify(&before).unwrap();
+    for index in 0..8 {
+        fixture.commit(
+            "history-file",
+            &format!("{index}\n"),
+            &format!("commit {index}"),
+        );
+    }
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Char('g'));
+    app.snapshot.commits[0].connectors = vec!["|\\".into(), "| |".into()];
+    draw_at(&app, 140, 20);
+    let geometry = app.geometry.borrow().clone();
+    assert_eq!(&geometry.rows[..3], &[0, 0, 0]);
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 5,
+        geometry.list.y + 3,
+    );
+    assert_eq!(app.selected, 0, "connector row belongs to its commit");
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 5,
+        geometry.list.y + 4,
+    );
+    assert_eq!(app.selected, 1);
+    wait(&mut app);
+    assert!(app.preview.contains("commit 6"));
+}
+
+#[test]
+fn dividers_drag_resize_with_shortcuts_and_restore_without_overwriting_other_settings() {
+    use crossterm::event::{
+        MouseButton::Left,
+        MouseEventKind::{Down, Drag, Up},
+    };
+    let fixture = Fixture::new();
+    fixture.write("a", "a\n");
+    fixture.write("b", "b\n");
+    let config = tempfile::tempdir().unwrap();
+    fs::write(
+        config.path().join("config.toml"),
+        "# layout test\ntheme = 'nord'\n[other]\nvalue = 42\n",
+    )
+    .unwrap();
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    app.config_root = Some(config.path().into());
+    draw_at(&app, 140, 40);
+    let geometry = app.geometry.borrow().clone();
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.divider.x,
+        geometry.divider.y + 2,
+    );
+    mouse(&mut app, Drag(Left), 70, 10);
+    mouse(&mut app, Up(Left), 70, 10);
+    assert_eq!(app.config.panes.files_width, 50);
+    assert_eq!(
+        config::Config::load(config.path())
+            .unwrap()
+            .panes
+            .files_width,
+        50
+    );
+    draw_at(&app, 140, 40);
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+    assert_eq!(app.config.panes.files_width, 52);
+    draw_at(&app, 60, 30);
+    let geometry = app.geometry.borrow().clone();
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.divider.x + 2,
+        geometry.divider.y,
+    );
+    mouse(
+        &mut app,
+        Drag(Left),
+        10,
+        geometry.area.y + geometry.area.height / 2,
+    );
+    mouse(&mut app, Up(Left), 10, 15);
+    let saved = config::Config::load(config.path()).unwrap();
+    assert_eq!(saved.panes.files_width, 52);
+    assert!((45..=50).contains(&saved.panes.files_height));
+    let mut reopened = app::App::ready(&fixture.repo.root).unwrap();
+    reopened.config = saved;
+    draw_at(&reopened, 140, 40);
+    assert_eq!(reopened.geometry.borrow().list.width, 72);
+    let text = fs::read_to_string(config.path().join("config.toml")).unwrap();
+    assert!(text.contains("# layout test") && text.contains("42") && text.contains("'nord'"));
+    key(&mut app, KeyCode::Char('2'));
+    draw_at(&app, 140, 40);
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    assert_eq!(app.config.panes.history_width, 48);
+    assert_eq!(app.config.panes.files_width, 52);
+}
+
+#[test]
+fn optimistic_stage_unstage_and_failure_reconcile_without_mutating_confirmed_snapshot() {
+    let fixture = Fixture::new();
+    fixture.commit("file", "base\n", "base");
+    fixture.write("file", "changed\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    let status = app.snapshot.files[0].status.clone();
+    key(&mut app, KeyCode::Char('s'));
+    assert_eq!(app.pending_staging.get(Path::new("file")), Some(&true));
+    assert_eq!(app.snapshot.files[0].status, status);
+    let terminal = draw_at(&app, 140, 40);
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.fg == app.theme.added)
+    );
+    wait(&mut app);
+    assert!(app.pending_staging.is_empty());
+    assert_eq!(app.snapshot.files[0].status, "M ");
+    key(&mut app, KeyCode::Char('u'));
+    assert_eq!(app.pending_staging.get(Path::new("file")), Some(&false));
+    assert_eq!(app.snapshot.files[0].status, "M ");
+    wait(&mut app);
+    assert_eq!(app.snapshot.files[0].status, " M");
+    assert!(app.pending_staging.is_empty());
+    fs::write(fixture.repo.root.join(".git/index.lock"), "test lock").unwrap();
+    key(&mut app, KeyCode::Char('s'));
+    assert_eq!(app.pending_staging.get(Path::new("file")), Some(&true));
+    wait(&mut app);
+    assert!(app.pending_staging.is_empty());
+    assert_eq!(app.snapshot.files[0].status, " M");
+    assert!(app.last_output.contains("index.lock"));
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("file")).unwrap(),
+        "changed\n"
+    );
+    assert!(
+        fixture
+            .repo
+            .bytes(&["diff", "--cached"])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn single_file_views_skip_the_tree_and_tree_toggle_does_not_capture_search_input() {
+    let fixture = Fixture::new();
+    fixture.commit("src/only-file", "base\n", "base");
+    fixture.write("src/only-file", "changed\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    draw_at(&app, 140, 40);
+    assert!(!app.files_tree_visible());
+    assert!(app.geometry.borrow().list.is_empty());
+    assert_eq!(app.focus, app::Focus::Preview);
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Char('1'));
+    assert_eq!(app.focus, app::Focus::Preview);
+    key(&mut app, KeyCode::Up);
+    assert!(
+        app.file_selected(),
+        "hidden folders must never become navigation targets"
+    );
+    key(&mut app, KeyCode::Char(' '));
+    assert!(app.busy.is_some());
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('T'));
+    draw_at(&app, 140, 40);
+    assert!(app.files_tree_visible() && !app.geometry.borrow().list.is_empty());
+    key(&mut app, KeyCode::Char('T'));
+    assert!(!app.files_tree_visible());
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    draw_at(&app, 140, 40);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if !view.show_tree && view.focus == app::Focus::Preview)
+    );
+    assert!(app.geometry.borrow().list.is_empty());
+    key(&mut app, KeyCode::Char('/'));
+    key(&mut app, KeyCode::Char('T'));
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.history.search.editing.as_deref() == Some("T") && !view.show_tree)
+    );
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Char('T'));
+    draw_at(&app, 140, 40);
+    assert!(matches!(&app.modal, Some(app::Modal::Commit(view)) if view.show_tree));
+    assert!(!app.geometry.borrow().list.is_empty());
+}
+
+#[test]
+fn adaptive_tree_handles_one_many_and_clean_changes_and_failed_layout_saves() {
+    use crossterm::event::{
+        MouseButton::Left,
+        MouseEventKind::{Down, Drag, Up},
+    };
+    let fixture = Fixture::new();
+    fixture.commit("a", "base\n", "base");
+    fixture.write("a", "changed\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    assert!(!app.files_tree_visible());
+    fixture.write("b", "new\n");
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert!(app.files_tree_visible());
+    let config = tempfile::tempdir().unwrap();
+    fs::write(config.path().join("config.toml"), "broken = [").unwrap();
+    app.config_root = Some(config.path().into());
+    draw_at(&app, 140, 40);
+    let geometry = app.geometry.borrow().clone();
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.divider.x,
+        geometry.divider.y + 2,
+    );
+    mouse(&mut app, Drag(Left), 70, 10);
+    mouse(&mut app, Up(Left), 70, 10);
+    assert_eq!(app.config.panes.files_width, 50);
+    assert!(
+        app.error
+            .as_deref()
+            .is_some_and(|error| error.contains("could not be saved"))
+    );
+    assert_eq!(
+        fs::read_to_string(config.path().join("config.toml")).unwrap(),
+        "broken = ["
+    );
+    key(&mut app, KeyCode::Char('T'));
+    assert!(!app.files_tree_visible());
+    fixture.write("a", "base\n");
+    fs::remove_file(fixture.repo.root.join("b")).unwrap();
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    assert!(
+        app.files_tree_visible(),
+        "clean state keeps its repository root"
+    );
+    assert_eq!(app.explorer.rows.len(), 1);
+}
+
+#[test]
+fn commit_browser_clicks_and_dividers_work_but_other_dialogs_block_mouse_input() {
+    use crossterm::event::{
+        MouseButton::Left,
+        MouseEventKind::{Down, Drag, Up},
+    };
+    let fixture = Fixture::new();
+    fixture.write("src/a", "first file\n");
+    fixture.commit("src/b", "second file\n", "two files");
+    let config = tempfile::tempdir().unwrap();
+    let mut app = open_history(&fixture);
+    app.config_root = Some(config.path().into());
+    draw_at(&app, 140, 40);
+    let geometry = app.geometry.borrow().clone();
+    let target = match &app.modal {
+        Some(app::Modal::Commit(view)) => view
+            .history
+            .tree
+            .rows
+            .iter()
+            .position(|row| row.file == Some(1))
+            .unwrap(),
+        _ => unreachable!(),
+    };
+    let visible = geometry.rows.iter().position(|row| *row == target).unwrap() as u16;
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 5,
+        geometry.list.y + 1 + visible,
+    );
+    wait(&mut app);
+    assert!(
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.selected == 1 && view.preview.contains("+second file"))
+    );
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.divider.x,
+        geometry.divider.y + 3,
+    );
+    mouse(&mut app, Drag(Left), 70, 15);
+    mouse(&mut app, Up(Left), 70, 15);
+    assert_eq!(
+        config::Config::load(config.path())
+            .unwrap()
+            .panes
+            .commit_width,
+        50
+    );
+    draw_at(&app, 60, 30);
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(app.config.panes.commit_height, 34);
+    key(&mut app, KeyCode::Esc);
+    draw_at(&app, 140, 40);
+    let before = app.selected;
+    key(&mut app, KeyCode::Char('?'));
+    mouse(
+        &mut app,
+        Down(Left),
+        geometry.list.x + 5,
+        geometry.list.y + 1,
+    );
+    assert_eq!(app.selected, before);
+    assert!(matches!(&app.modal, Some(app::Modal::Help { .. })));
+}
+
+#[test]
+fn all_file_and_hunk_staging_are_immediate_and_keep_working_content() {
+    let fixture = Fixture::new();
+    fixture.commit("file", "base\n", "base");
+    fixture.write("file", "staged\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    key(&mut app, KeyCode::Char('S'));
+    assert!(app.modal.is_none() && app.busy.is_some());
+    wait(&mut app);
+    fixture.write("file", "working\n");
+    key(&mut app, KeyCode::Char('r'));
+    wait(&mut app);
+    key(&mut app, KeyCode::Char('S'));
+    assert!(app.modal.is_none() && app.busy.is_some());
+    wait(&mut app);
+    assert!(
+        fixture
+            .action(&["diff", "--cached"])
+            .text()
+            .contains("+working")
+    );
+    key(&mut app, KeyCode::Char('U'));
+    assert!(app.modal.is_none() && app.busy.is_some());
+    wait(&mut app);
+    assert!(fixture.action(&["diff", "--cached"]).text().is_empty());
+    key(&mut app, KeyCode::Char('v'));
+    wait(&mut app);
+    assert!(matches!(app.modal, Some(app::Modal::Hunks(_))));
+    key(&mut app, KeyCode::Char('s'));
+    assert!(app.modal.is_none() && app.busy.is_some());
+    wait(&mut app);
+    assert!(
+        fixture
+            .action(&["diff", "--cached"])
+            .text()
+            .contains("+working")
+    );
+    key(&mut app, KeyCode::Char('v'));
+    wait(&mut app);
+    assert!(matches!(&app.modal, Some(app::Modal::Hunks(hunks)) if hunks.cached));
+    key(&mut app, KeyCode::Char('s'));
+    assert!(app.modal.is_none() && app.busy.is_some());
+    wait(&mut app);
+    assert!(fixture.action(&["diff", "--cached"]).text().is_empty());
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("file")).unwrap(),
+        "working\n"
+    );
+    assert!(app.error.is_none(), "{:?}", app.error);
+}
+
+#[test]
+fn path_tooltips_reveal_full_names_by_keyboard_and_hover_without_selecting() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let fixture = Fixture::new();
+    for index in 0..35 {
+        fixture.write(
+            &format!("deep/nested/{index:02}-long-unambiguous-filename-雪.txt"),
+            "content\n",
+        );
+    }
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+    let text = |terminal: &Terminal<TestBackend>| {
+        // TestBackend retains continuation cells; real terminals display only
+        // the leading cell of each wide character.
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in buffer.content.chunks(usize::from(buffer.area.width)) {
+            let mut skip = 0;
+            for cell in row {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                text.push_str(cell.symbol());
+                skip = ratatui::text::Span::raw(cell.symbol())
+                    .width()
+                    .saturating_sub(1);
+            }
+        }
+        text
+    };
+    key(&mut app, KeyCode::Char('w'));
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    assert!(text(&terminal).contains("Full path"));
+    assert!(text(&terminal).contains("deep/nested/00-long-unambiguous-filename-雪.txt"));
+    key(&mut app, KeyCode::Esc);
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    assert!(!text(&terminal).contains("Full path"));
+    for _ in 0..30 {
+        key(&mut app, KeyCode::Down);
+    }
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    let offset = app.explorer_state.borrow().offset();
+    assert!(offset > 0);
+    let selected = app.explorer.cursor;
+    let hovered = app.explorer.rows[offset]
+        .path
+        .to_string_lossy()
+        .into_owned();
+    // First visible tree row, accounting for the header, tabs and border.
+    app.mouse_position = Some((5, 5));
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    assert!(text(&terminal).contains("Full path"));
+    assert!(
+        text(&terminal).contains(&hovered),
+        "expected {hovered:?} at offset {offset}: {}",
+        text(&terminal)
+    );
+    assert_eq!(app.explorer.cursor, selected);
+    app.mouse_position = Some((139, 29));
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    assert!(!text(&terminal).contains("Full path"));
+    for (width, height) in [(44, 12), (60, 24), (100, 40)] {
+        key(&mut app, KeyCode::Char('w'));
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        assert!(text(&terminal).contains("Full path"));
+        key(&mut app, KeyCode::Esc);
+    }
+}
+
+#[test]
+fn destructive_confirmation_is_centered_over_the_workspace_and_escape_cancels() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let fixture = Fixture::new();
+    fixture.commit("file", "base\n", "base");
+    fixture.write("file", "changed\n");
+    let mut app = app::App::ready(&fixture.repo.root).unwrap();
+    let before = fixture.repo.guard().unwrap();
+    key(&mut app, KeyCode::Char(':'));
+    app.handle_paste("discard");
+    key(&mut app, KeyCode::Enter);
+    for (width, height) in [(140, 40), (60, 24)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(0, 4)].symbol(),
+            "┌",
+            "workspace remains behind modal"
+        );
+        let rendered = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("file"));
+        assert!(rendered.contains("Review action"));
+        assert!(rendered.contains("[y] Proceed"));
+    }
+    app.handle_paste("y");
+    assert!(app.busy.is_none());
+    key(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none() && app.busy.is_none());
+    fixture.repo.verify(&before).unwrap();
+}
+
+#[test]
 fn quitting_during_a_worker_requests_orderly_completion() {
     let fixture = Fixture::new();
     fixture.write("file", "keep this content\n");
@@ -1123,8 +2023,7 @@ fn ui_stages_updates_to_a_staged_rename_and_unstages_both_paths() {
     let mut app = app::App::ready(&fixture.repo.root).unwrap();
     assert!(app.snapshot.files[0].original.is_some());
     key(&mut app, KeyCode::Char('s'));
-    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     assert!(app.error.is_none(), "{:?}", app.error);
     assert!(fixture.repo.bytes(&["diff", "--"]).unwrap().is_empty());
@@ -1794,13 +2693,13 @@ fn parent_switch_preserves_active_file_collapsed_folder_layout_and_search() {
     key(&mut app, KeyCode::Char('/'));
     app.handle_paste("combined");
     key(&mut app, KeyCode::Enter);
-    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('T')); // Reveal the normally hidden single-file tree.
     key(&mut app, KeyCode::Char('h'));
     key(&mut app, KeyCode::Char('h'));
     key(&mut app, KeyCode::Char('P'));
     wait(&mut app);
     assert!(
-        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.commit.parent == 1 && view.commit.files[view.selected].path == Path::new("src/shared") && view.history.tree.collapsed.contains(Path::new("src")) && view.history.layout == history::DiffLayout::SideBySide && view.history.search.query == "combined" && view.history.search.matches.len() == 1)
+        matches!(&app.modal, Some(app::Modal::Commit(view)) if view.show_tree && view.commit.parent == 1 && view.commit.files[view.selected].path == Path::new("src/shared") && view.history.tree.collapsed.contains(Path::new("src")) && view.history.layout == history::DiffLayout::SideBySide && view.history.search.query == "combined" && view.history.search.matches.len() == 1)
     );
 }
 
@@ -1904,6 +2803,7 @@ fn history_rapid_file_changes_keep_the_final_document_and_query() {
         key(&mut app, KeyCode::Char('['));
     }
     key(&mut app, KeyCode::Char(']'));
+    key(&mut app, KeyCode::Tab); // Search the diff, not the focused file tree.
     key(&mut app, KeyCode::Char('/'));
     app.handle_paste("needle");
     key(&mut app, KeyCode::Enter);
@@ -2072,23 +2972,16 @@ fn explorer_uses_detected_project_root_when_launched_inside_a_subdirectory() {
 }
 
 #[test]
-fn project_root_supports_reviewed_staging_and_remains_visible_when_clean() {
+fn project_root_supports_immediate_staging_and_remains_visible_when_clean() {
     let fixture = Fixture::new();
     fixture.write("src/a", "base\n");
     fixture.commit("root-file", "base\n", "base");
     fixture.write("src/a", "changed\n");
     fixture.write("root-file", "changed\n");
-    let before = fixture.repo.guard().unwrap();
     let mut app = app::App::ready(&fixture.repo.root).unwrap();
     key(&mut app, KeyCode::Home);
     key(&mut app, KeyCode::Char('s'));
-    assert!(
-        matches!(&app.modal, Some(app::Modal::Confirm { task: app::Task::Git(action), detail }) if detail.contains(&fixture.repo.root.display().to_string()) && action.args.iter().all(|arg| !arg.is_empty()))
-    );
-    key(&mut app, KeyCode::Char('n'));
-    fixture.repo.verify(&before).unwrap();
-    key(&mut app, KeyCode::Char('s'));
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     assert_eq!(
         fixture
@@ -2143,7 +3036,7 @@ fn staging_files_and_folders_with_spaces_preserves_literal_paths() {
 }
 
 #[test]
-fn space_toggles_file_staging_and_partial_staging_still_requires_review() {
+fn space_toggles_file_staging_and_partial_staging_immediately() {
     let fixture = Fixture::new();
     fixture.commit("file with spaces", "base\n", "base");
     fixture.write("file with spaces", "changed\n");
@@ -2157,8 +3050,7 @@ fn space_toggles_file_staging_and_partial_staging_still_requires_review() {
             .contains("+changed")
     );
     key(&mut app, KeyCode::Char(' '));
-    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     assert!(
         fixture
@@ -2172,18 +3064,7 @@ fn space_toggles_file_staging_and_partial_staging_still_requires_review() {
     key(&mut app, KeyCode::Char('r'));
     wait(&mut app);
     key(&mut app, KeyCode::Char(' '));
-    assert!(
-        matches!(&app.modal, Some(app::Modal::Confirm { detail, .. }) if detail.contains("Replace the staged version"))
-    );
-    key(&mut app, KeyCode::Char('n'));
-    assert!(
-        fixture
-            .action(&["diff", "--cached"])
-            .text()
-            .contains("+changed")
-    );
-    key(&mut app, KeyCode::Char(' '));
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     assert!(
         fixture
@@ -2201,10 +3082,7 @@ fn space_targets_folders_and_project_root_but_not_previews_prompts_or_paste() {
     let mut app = app::App::ready(&fixture.repo.root).unwrap();
     select_folder(&mut app, "src");
     key(&mut app, KeyCode::Char(' '));
-    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
-    app.handle_paste("y ");
-    assert!(app.busy.is_none());
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     assert_eq!(fixture.action(&["ls-files"]).text().trim(), "src/a");
     key(&mut app, KeyCode::Char(' '));
@@ -2213,8 +3091,7 @@ fn space_targets_folders_and_project_root_but_not_previews_prompts_or_paste() {
     assert!(fixture.action(&["ls-files"]).text().is_empty());
     key(&mut app, KeyCode::Home);
     key(&mut app, KeyCode::Char(' '));
-    assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     assert_eq!(fixture.action(&["ls-files"]).text().lines().count(), 2);
     key(&mut app, KeyCode::Char(' '));
@@ -2293,7 +3170,7 @@ fn operation_markers_are_checked_in_the_linked_worktrees_own_git_directory() {
 }
 
 #[test]
-fn working_tree_explorer_compacts_paths_and_stages_only_the_reviewed_folder() {
+fn working_tree_explorer_compacts_paths_and_stages_only_the_selected_folder() {
     let fixture = Fixture::new();
     fixture.write("apps/portal/src/feature/a.ts", "base a\n");
     fixture.write("apps/portal/src/feature/b.ts", "base b\n");
@@ -2311,10 +3188,7 @@ fn working_tree_explorer_compacts_paths_and_stages_only_the_reviewed_folder() {
     select_folder(&mut app, "apps/portal/src/feature");
     assert!(!app.file_selected());
     key(&mut app, KeyCode::Char('s'));
-    assert!(
-        matches!(&app.modal, Some(app::Modal::Confirm { detail, .. }) if detail.contains("a.ts") && detail.contains("b.ts") && !detail.contains("outside change"))
-    );
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     let staged = fixture.action(&["diff", "--cached", "--name-only"]).text();
     assert!(staged.contains("a.ts") && staged.contains("b.ts") && !staged.contains("outside"));
@@ -2324,8 +3198,7 @@ fn working_tree_explorer_compacts_paths_and_stages_only_the_reviewed_folder() {
     );
     select_folder(&mut app, "apps/portal/src/feature");
     key(&mut app, KeyCode::Char('u'));
-    assert!(matches!(&app.modal, Some(app::Modal::Confirm { .. })));
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     assert!(
         fixture
@@ -2541,7 +3414,7 @@ fn terminal_background_survives_theme_changes_and_dialog_rendering() {
 }
 
 #[test]
-fn folder_unstage_reviews_rename_sources_outside_the_folder() {
+fn folder_unstage_includes_rename_sources_outside_the_folder() {
     let fixture = Fixture::new();
     fixture.commit("old", "rename me\n", "base");
     fs::create_dir(fixture.repo.root.join("target-dir")).unwrap();
@@ -2549,10 +3422,7 @@ fn folder_unstage_reviews_rename_sources_outside_the_folder() {
     let mut app = app::App::ready(&fixture.repo.root).unwrap();
     select_folder(&mut app, "target-dir");
     key(&mut app, KeyCode::Char('u'));
-    assert!(
-        matches!(&app.modal, Some(app::Modal::Confirm { detail, .. }) if detail.contains("old") && detail.contains("target-dir/new"))
-    );
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     assert!(
         fixture
@@ -2568,7 +3438,7 @@ fn folder_unstage_reviews_rename_sources_outside_the_folder() {
 }
 
 #[test]
-fn folder_staging_literal_names_and_partial_staging_are_confirmed() {
+fn folder_staging_literal_names_and_partial_staging_are_immediate() {
     let fixture = Fixture::new();
     fixture.write("[folder]/a", "base\n");
     fixture.commit("folder/a", "base\n", "base");
@@ -2576,17 +3446,10 @@ fn folder_staging_literal_names_and_partial_staging_are_confirmed() {
     fixture.success(&["add", "--", "[folder]/a"]);
     fixture.write("[folder]/a", "working\n");
     fixture.write("folder/a", "unrelated\n");
-    let before = fixture.repo.guard().unwrap();
     let mut app = app::App::ready(&fixture.repo.root).unwrap();
     select_folder(&mut app, "[folder]");
     key(&mut app, KeyCode::Char('s'));
-    assert!(
-        matches!(&app.modal, Some(app::Modal::Confirm { detail, .. }) if detail.contains("staged-only"))
-    );
-    key(&mut app, KeyCode::Char('n'));
-    fixture.repo.verify(&before).unwrap();
-    key(&mut app, KeyCode::Char('s'));
-    key(&mut app, KeyCode::Char('y'));
+    assert!(app.modal.is_none() && app.busy.is_some());
     wait(&mut app);
     let staged = fixture.action(&["diff", "--cached"]).text();
     assert!(staged.contains("+working") && !staged.contains("unrelated"));

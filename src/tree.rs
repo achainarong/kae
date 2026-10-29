@@ -1,6 +1,6 @@
 //! Working-tree presentation reuses history's byte-preserving tree identities.
 use crate::{
-    git::{CommittedFile, FileChange},
+    git::{CommittedFile, FileChange, Snapshot},
     history::FileTree,
 };
 use std::path::Path;
@@ -17,10 +17,59 @@ pub fn explorer(files: &[FileChange], root: &Path) -> FileTree {
     FileTree::compact(&files).with_root(root.file_name().unwrap_or(root.as_os_str()).to_owned())
 }
 
+pub fn remotes(snapshot: &Snapshot) -> FileTree {
+    let files = snapshot
+        .remote_branches
+        .iter()
+        .map(|branch| CommittedFile {
+            path: format!("{}/{}", branch.remote, branch.branch).into(),
+            status: String::new(),
+            original: None,
+        })
+        .collect::<Vec<_>>();
+    let mut tree = FileTree::new(&files)
+        .with_directories(&snapshot.remotes.iter().map(Into::into).collect::<Vec<_>>());
+    tree.cursor = 0;
+    tree
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+    #[test]
+    fn remote_names_are_independent_roots_even_with_slashes_or_ref_collisions() {
+        let mut snapshot = Snapshot::loading();
+        snapshot.remotes = vec!["origin".into(), "origin/team".into(), "empty".into()];
+        snapshot.remote_branches = [("origin", "z"), ("origin", "team"), ("origin/team", "main")]
+            .map(|(remote, branch)| crate::git::RemoteBranch {
+                remote: remote.into(),
+                branch: branch.into(),
+                oid: "abc".into(),
+            })
+            .into();
+        let mut tree = remotes(&snapshot);
+        let root = tree
+            .rows
+            .iter()
+            .find(|row| row.path == Path::new("origin") && row.file.is_none())
+            .unwrap();
+        assert_eq!((root.depth, root.count), (0, 2));
+        let nested = tree
+            .rows
+            .iter()
+            .find(|row| row.path == Path::new("origin/team") && row.file.is_none())
+            .unwrap();
+        assert_eq!((nested.depth, nested.count), (0, 1));
+        assert_eq!(nested.name, "origin/team");
+        tree.set_filter("origin/team/main");
+        assert_eq!(tree.rows.len(), 2);
+        assert!(
+            tree.rows
+                .iter()
+                .all(|row| row.path.starts_with("origin/team"))
+        );
+    }
     #[test]
     fn compact_chains_keep_parent_navigation_and_counts() {
         let mut tree = explorer(

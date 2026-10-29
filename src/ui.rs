@@ -16,6 +16,63 @@ use crate::{
     theme::Theme,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneKind {
+    Files,
+    History,
+    Commit,
+}
+
+#[derive(Clone, Default)]
+pub struct PaneGeometry {
+    pub kind: Option<PaneKind>,
+    pub area: Rect,
+    pub list: Rect,
+    pub preview: Rect,
+    pub divider: Rect,
+    pub rows: Vec<usize>,
+    pub disclosures: Vec<(u16, u16)>,
+}
+
+fn pane_geometry(area: Rect, percent: u16, visible: bool, kind: Option<PaneKind>) -> PaneGeometry {
+    if !visible {
+        return PaneGeometry {
+            kind,
+            area,
+            preview: area,
+            ..PaneGeometry::default()
+        };
+    }
+    let horizontal = area.width >= 100;
+    let total = if horizontal { area.width } else { area.height };
+    let minimum = if horizontal { 20 } else { 3 };
+    let lower = minimum.min(total / 2);
+    let size = ((u32::from(total) * u32::from(percent.clamp(15, 85)) / 100) as u16)
+        .clamp(lower, total.saturating_sub(lower));
+    let panes = Layout::default()
+        .direction(if horizontal {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints([Constraint::Length(size), Constraint::Min(0)])
+        .split(area);
+    let divider = if horizontal {
+        Rect::new(panes[0].right().saturating_sub(1), area.y, 2, area.height)
+    } else {
+        Rect::new(area.x, panes[0].bottom().saturating_sub(1), area.width, 2)
+    };
+    PaneGeometry {
+        kind,
+        area,
+        list: panes[0],
+        preview: panes[1],
+        divider,
+        rows: Vec::new(),
+        disclosures: Vec::new(),
+    }
+}
+
 pub fn minimum_size(app: &App) -> (u16, u16) {
     if matches!(
         app.modal,
@@ -35,6 +92,8 @@ pub fn minimum_size(app: &App) -> (u16, u16) {
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    *app.geometry.borrow_mut() = PaneGeometry::default();
+    app.tab_hits.borrow_mut().clear();
     let theme = &app.theme;
     let area = frame.area();
     frame.render_widget(
@@ -102,6 +161,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
             })
         })
         .collect::<Vec<_>>();
+    let mut tab_x = rows[1].x;
+    for (label, workspace) in tabs.iter().zip(Workspace::ALL) {
+        let width = (label.width() as u16 + 2).min(rows[1].right().saturating_sub(tab_x));
+        app.tab_hits
+            .borrow_mut()
+            .push((Rect::new(tab_x, rows[1].y, width, 1), workspace));
+        tab_x = tab_x.saturating_add(width + 1);
+    }
     frame.render_widget(
         Tabs::new(tabs)
             .select(app.workspace.index())
@@ -110,19 +177,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
         rows[1],
     );
 
-    if app.modal.is_none() {
-        let panes = split(
+    if app.modal.is_none() || matches!(app.modal, Some(Modal::Confirm { .. })) {
+        let kind = match app.workspace {
+            Workspace::Files => Some(PaneKind::Files),
+            Workspace::History => Some(PaneKind::History),
+            _ => None,
+        };
+        let geometry = pane_geometry(
             rows[2],
-            if app.workspace == Workspace::History {
-                50
-            } else {
-                32
-            },
+            app.pane_percent(kind, area.width >= 100),
+            app.workspace != Workspace::Files || app.files_tree_visible(),
+            kind,
         );
-        let items: Vec<ListItem> = app
-            .items()
-            .into_iter()
-            .enumerate()
+        let panes = [geometry.list, geometry.preview];
+        *app.geometry.borrow_mut() = geometry;
+        let visible = app.visible_items();
+        let heights = visible
+            .iter()
+            .map(|(_, item)| item.lines().count().max(1))
+            .collect::<Vec<_>>();
+        let items: Vec<ListItem> = visible
+            .iter()
             .map(|(index, item)| {
                 let text = if app.workspace == Workspace::History {
                     Text::from(
@@ -131,10 +206,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
                             .collect::<Vec<_>>(),
                     )
                 } else {
-                    Text::raw(safe_text(&item))
+                    Text::raw(safe_text(item))
                 };
                 let color = if app.workspace == Workspace::Files
-                    && app.snapshot.files[index].is_conflict()
+                    && app.snapshot.files[*index].is_conflict()
                 {
                     theme.deleted
                 } else {
@@ -143,63 +218,142 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 ListItem::new(text).style(Style::default().fg(color))
             })
             .collect();
-        let title = format!(
-            " {} · {} {} ",
-            app.workspace.title(),
-            items.len(),
-            if app.workspace == Workspace::History {
-                "commits (latest 300)"
-            } else {
-                "items"
-            }
-        );
+        let title = if app.workspace == Workspace::History {
+            format!(
+                " History · {} · {} · g graph · B scope ",
+                if app.snapshot.all_history {
+                    "all branches"
+                } else {
+                    "current branch"
+                },
+                items.len()
+            )
+        } else {
+            format!(
+                " {} · {} {} ",
+                app.workspace.title(),
+                items.len(),
+                if app.workspace == Workspace::History {
+                    "commits (latest 300)"
+                } else {
+                    "items"
+                }
+            )
+        };
         let list = List::new(items)
             .block(panel(theme, title, app.focus == Focus::List))
             .highlight_style(Style::default().bg(theme.selection).fg(theme.text).bold())
             .highlight_symbol("› ");
-        let mut state = ListState::default().with_selected(if app.items().is_empty() {
-            None
-        } else {
-            Some(app.selected)
-        });
+        let mut state = app.list_state.borrow_mut();
+        state.select(visible.iter().position(|(index, _)| *index == app.selected));
         if app.workspace == Workspace::Files {
             draw_explorer(frame, app, panes[0]);
         } else {
-            frame.render_stateful_widget(list, panes[0], &mut state);
+            frame.render_stateful_widget(list, panes[0], &mut *state);
         }
-        frame.render_widget(
-            Paragraph::new(diff_window(
-                theme,
-                &app.preview,
-                usize::from(app.scroll),
-                panes[1].height.saturating_sub(2),
-            ))
-            .scroll((0, app.horizontal))
-            .block(panel(
-                theme,
-                if app.workspace == Workspace::Files {
-                    app.explorer
-                        .selected()
-                        .map(|row| {
-                            let path = if row.path.as_os_str().is_empty() {
-                                &app.repo.root
-                            } else {
-                                &row.path
-                            };
-                            format!(" {} ", safe_text(&path.to_string_lossy()))
-                        })
-                        .unwrap_or_else(|| " Working tree ".into())
+        let offset = if app.workspace == Workspace::Files {
+            app.explorer_state.borrow().offset()
+        } else {
+            state.offset()
+        };
+        let mut geometry = app.geometry.borrow_mut();
+        if app.workspace == Workspace::Files {
+            geometry.rows = (offset..app.explorer.rows.len())
+                .take(usize::from(panes[0].height.saturating_sub(2)))
+                .collect();
+        } else {
+            geometry.rows = heights
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .flat_map(|(index, height)| std::iter::repeat_n(visible[index].0, *height))
+                .take(usize::from(panes[0].height.saturating_sub(2)))
+                .collect();
+        }
+        if matches!(app.workspace, Workspace::Files | Workspace::Remotes) && !panes[0].is_empty() {
+            let tree = if app.workspace == Workspace::Files {
+                &app.explorer
+            } else {
+                &app.remote_tree
+            };
+            geometry.disclosures = geometry
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(line, index)| {
+                    let row = tree.rows.get(*index)?;
+                    if row.file.is_some() {
+                        return None;
+                    }
+                    let depth = if app.workspace == Workspace::Files {
+                        row.depth
+                            .min(usize::from(panes[0].width.saturating_sub(20) / 2))
+                    } else {
+                        row.depth
+                    };
+                    Some((
+                        panes[0].x + 3 + (depth * 2) as u16,
+                        panes[0].y + 1 + line as u16,
+                    ))
+                })
+                .collect();
+        }
+        drop(geometry);
+        draw_workspace_preview(frame, app, panes[1]);
+        if app.modal.is_none() && app.workspace == Workspace::Files {
+            draw_path_tooltip(
+                frame,
+                app,
+                if panes[0].width == 0 {
+                    panes[1]
                 } else {
-                    " Diff / details · Enter browse commit · Tab focus ".into()
+                    panes[0]
                 },
-                app.focus == Focus::Preview,
-            )),
-            panes[1],
-        );
+            );
+        }
     }
 
     if let Some(modal) = &app.modal {
         draw_modal(frame, app, modal, rows[2]);
+    }
+    if app.modal.is_none() {
+        let filter = &app.filters[app.workspace.index()];
+        let search = &app.preview_search;
+        let text = if search.editing.is_some()
+            || (app.focus == Focus::Preview && !search.query.is_empty())
+        {
+            Some(format!(
+                " / search: {}{} · {}/{} matches · n/N next/previous · Esc clear",
+                safe_text(search.editing.as_ref().unwrap_or(&search.query)),
+                if search.editing.is_some() { "▏" } else { "" },
+                search.active.map(|index| index + 1).unwrap_or(0),
+                search.matches.len()
+            ))
+        } else if filter.editing || !filter.query.is_empty() {
+            let count = if app.workspace == Workspace::Files {
+                app.explorer
+                    .rows
+                    .iter()
+                    .filter(|row| row.file.is_some())
+                    .count()
+            } else {
+                app.visible_items().len()
+            };
+            Some(format!(
+                " / filter: {}{} · {} matches · Enter keep · Esc clear",
+                safe_text(&filter.query),
+                if filter.editing { "▏" } else { "" },
+                count
+            ))
+        } else {
+            None
+        };
+        if let Some(text) = text {
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(theme.accent)),
+                Rect::new(rows[1].x, rows[1].y + 1, rows[1].width, 1),
+            );
+        }
     }
 
     let status = app
@@ -229,6 +383,84 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
 }
 
+fn draw_workspace_preview(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let file = app
+        .snapshot
+        .files
+        .get(app.selected)
+        .filter(|_| app.workspace == Workspace::Files && app.file_selected());
+    let pending = file
+        .and_then(|file| app.pending_staging.get(&file.path))
+        .copied();
+    let color = if file
+        .is_some_and(|file| pending.unwrap_or(!matches!(file.status.as_bytes()[0], b' ' | b'?')))
+    {
+        theme.added
+    } else {
+        theme.text
+    };
+    let title = if app.workspace == Workspace::Files {
+        let path = app.explorer.selected().map(|row| {
+            if row.path.as_os_str().is_empty() {
+                &app.repo.root
+            } else {
+                &row.path
+            }
+        });
+        format!(
+            " {}{} ",
+            path.map(|path| safe_text(&path.to_string_lossy()))
+                .unwrap_or_else(|| "Working tree".into()),
+            pending
+                .map(|staged| if staged {
+                    " · staging…"
+                } else {
+                    " · unstaging…"
+                })
+                .unwrap_or("")
+        )
+    } else if app.workspace == Workspace::Remotes {
+        " Remote / branch details · Enter expand/collapse ".into()
+    } else {
+        " Diff / details · Enter browse commit · Tab focus ".into()
+    };
+    let block =
+        panel(theme, title, app.focus == Focus::Preview).title_style(Style::default().fg(color));
+    let mut inner = block.inner(area);
+    frame.render_widget(block, area);
+    if app.workspace == Workspace::Files
+        && !app.files_tree_visible()
+        && let Some(file) = file
+    {
+        let path = wrap_path(&safe_text(&file.path.to_string_lossy()), inner.width);
+        let height = (path.len() + 1).min(usize::from(inner.height.saturating_sub(1))) as u16;
+        frame.render_widget(
+            Paragraph::new(path.join("\n")).style(Style::default().fg(color)),
+            Rect::new(inner.x, inner.y, inner.width, height),
+        );
+        inner.y += height;
+        inner.height = inner.height.saturating_sub(height);
+    }
+    let mut text = diff_window(theme, &app.preview, usize::from(app.scroll), inner.height);
+    for (offset, line) in text.lines.iter_mut().enumerate() {
+        let source = usize::from(app.scroll) + offset;
+        if !app.preview_search.on_line(source).is_empty()
+            && let Some(raw) = app.preview.lines().nth(source)
+        {
+            line.spans = highlighted(
+                theme,
+                raw,
+                source,
+                0,
+                &app.preview_search,
+                patch_style(theme, raw),
+            );
+        }
+    }
+    frame.render_widget(Paragraph::new(text).scroll((0, app.horizontal)), inner);
+}
+
 fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let items = app
@@ -244,8 +476,9 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
             match row.file.and_then(|index| app.snapshot.files.get(index)) {
                 Some(file) => {
                     let status = file.status.as_bytes();
-                    let staged = !matches!(status[0], b' ' | b'?');
-                    let color = if file.is_conflict() {
+                    let pending = app.pending_staging.get(&file.path).copied();
+                    let staged = pending.unwrap_or(!matches!(status[0], b' ' | b'?'));
+                    let color = if file.is_conflict() && pending.is_none() {
                         theme.deleted
                     } else if staged {
                         theme.added
@@ -277,8 +510,16 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
                         Span::raw(indent),
                         Span::raw("  "),
                         Span::styled(
-                            (status[0] as char).to_string(),
-                            Style::default().fg(index_color),
+                            if pending.is_some() {
+                                "·".into()
+                            } else {
+                                (status[0] as char).to_string()
+                            },
+                            Style::default().fg(if pending.is_some() {
+                                if staged { theme.added } else { theme.muted }
+                            } else {
+                                index_color
+                            }),
                         ),
                         Span::styled(
                             (status[1] as char).to_string(),
@@ -297,8 +538,13 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
                     let (mut staged, mut working) = (0, 0);
                     for file in files {
                         let status = file.status.as_bytes();
-                        staged += usize::from(!matches!(status[0], b' ' | b'?'));
-                        working += usize::from(status[1] != b' ');
+                        if let Some(pending) = app.pending_staging.get(&file.path) {
+                            staged += usize::from(*pending);
+                            working += usize::from(!*pending);
+                        } else {
+                            staged += usize::from(!matches!(status[0], b' ' | b'?'));
+                            working += usize::from(status[1] != b' ');
+                        }
                     }
                     let prefix = format!(
                         "{indent}{} ",
@@ -344,11 +590,83 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
         ))
         .highlight_style(Style::default().bg(theme.selection).bold())
         .highlight_symbol("› ");
-    frame.render_stateful_widget(
-        list,
-        area,
-        &mut ListState::default().with_selected(selected),
+    let mut state = app.explorer_state.borrow_mut();
+    state.select(selected);
+    frame.render_stateful_widget(list, area, &mut *state);
+}
+
+fn draw_path_tooltip(frame: &mut Frame, app: &App, tree: Rect) {
+    if !app.files_tree_visible() && !app.show_path {
+        return;
+    }
+    let inner = tree.inner(ratatui::layout::Margin::new(1, 1));
+    let offset = app.explorer_state.borrow().offset();
+    let (index, anchor_y) = if app.show_path {
+        let row = app
+            .explorer
+            .cursor
+            .saturating_sub(offset)
+            .min(usize::from(inner.height.saturating_sub(1))) as u16;
+        (app.explorer.cursor, inner.y.saturating_add(row))
+    } else if let Some((x, y)) = app.mouse_position {
+        if !inner.contains(ratatui::layout::Position::new(x, y)) {
+            return;
+        }
+        (offset + usize::from(y - inner.y), y)
+    } else {
+        return;
+    };
+    let Some(row) = app.explorer.rows.get(index) else {
+        return;
+    };
+    let path = if row.path.as_os_str().is_empty() {
+        &app.repo.root
+    } else {
+        &row.path
+    };
+    let text = safe_text(&path.to_string_lossy());
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(100);
+    if width < 4 {
+        return;
+    }
+    let lines = wrap_path(&text, width - 2);
+    let height = (lines.len().min(u16::MAX as usize) as u16)
+        .saturating_add(2)
+        .min(screen.height.saturating_sub(2));
+    let x = inner.x.min(screen.right().saturating_sub(width + 1));
+    let y = if anchor_y.saturating_add(height + 1) < screen.bottom() {
+        anchor_y + 1
+    } else {
+        anchor_y.saturating_sub(height).max(screen.y)
+    };
+    let popup = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .style(Style::default().fg(app.theme.text).bg(app.theme.background))
+            .block(
+                Block::bordered()
+                    .title(" Full path · w / Esc close ")
+                    .border_style(Style::default().fg(app.theme.accent)),
+            ),
+        popup,
     );
+}
+
+fn wrap_path(text: &str, width: u16) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    let mut used = 0;
+    for character in text.chars() {
+        let size = Span::raw(character.to_string()).width();
+        if used + size > usize::from(width) && used > 0 {
+            lines.push(String::new());
+            used = 0;
+        }
+        lines.last_mut().expect("initial line").push(character);
+        used += size;
+    }
+    lines
 }
 
 fn tail_name(name: &str, width: u16) -> String {
@@ -370,6 +688,18 @@ fn tail_name(name: &str, width: u16) -> String {
 
 fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
     let theme = &app.theme;
+    let area = if matches!(modal, Modal::Confirm { .. }) {
+        let width = area.width.saturating_sub(4).min(90);
+        let height = area.height.saturating_sub(2).min(20);
+        Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        )
+    } else {
+        area
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default().style(Style::default().fg(theme.text).bg(theme.background)),
@@ -408,16 +738,23 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                     "Navigate: 1–7 workspace · [/] workspace · Tab list/preview\n",
                     "j/k or arrows move · h/l horizontal · PgUp/PgDn scroll\n\n",
                     "Files: s/u stage/unstage · S/U all · v hunks · e external editor\n",
+                    "Files: hover or w shows full path · staging/unstaging is immediate\n",
+                    "Mouse: click names selects · click arrows toggles · click tabs switches\n",
+                    "Drag border resizes · remote trees support Enter and left/right\n",
+                    "Ctrl-left/right resize columns · Ctrl-up/down resize stacked panes\n",
+                    "T toggles file tree (one file opens directly); pane sizes are saved\n",
                     "Enter on conflict: resolve · c commit · a amend\n",
                     "Branches: Enter switch · b new branch\n",
                     "History: Enter file tree · Enter folder/file · h/l collapse/expand\n",
+                    "History list: g toggles graph · B current/all branches\n",
                     "Inside a commit: [/] file · {/} hunk · / text search · n/N match\n",
                     "d unified/split · t full file · Tab focus · P merge parent\n",
                     "History / branches / tags: m preview merge · M merge\n",
                     "History: i interactive rebase (selected commit is the base)\n",
                     "Remotes: f review fetch · p pull fast-forward only · P push\n",
                     "Operation: C review continue · A review abort · : skip / review\n\n",
-                    ": or / opens command search in the main view.\n",
+                    ": commands · / filters focused list/tree or searches focused preview\n",
+                    "Enter keeps filter · Esc clears · n/N moves between text matches\n",
                     "Prompts: type · Backspace · Ctrl-U clear · Enter accept · Esc cancel\n",
                     "Confirmations: only typed y proceeds; n / Esc cancels.\n",
                     "Conflicts: 1 current · 2 incoming · 3 both · 4 reverse\n",
@@ -521,7 +858,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             frame.render_widget(&editor.area, rows[0]);
             frame.render_widget(Paragraph::new("Type to edit · arrows / Home / End move · Ctrl-Z undo · Ctrl-Y redo\nCtrl-S review save (not stage) · Esc keep draft and return · q inserts text"), rows[1]);
         }
-        Modal::Commit(view) => draw_commit(theme, frame, view, area),
+        Modal::Commit(view) => draw_commit(app, frame, view, area),
         Modal::Hunks(hunks) => draw_hunks(theme, frame, hunks, area),
         Modal::Rebase(plan) => draw_rebase(theme, frame, plan, area),
     }
@@ -667,9 +1004,23 @@ fn draw_conflict(theme: &Theme, frame: &mut Frame, conflict: &Conflict, area: Re
     );
 }
 
-fn draw_commit(theme: &Theme, frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
+fn draw_commit(app: &App, frame: &mut Frame, view: &crate::app::CommitView, area: Rect) {
+    let theme = &app.theme;
+    let full_path = view
+        .commit
+        .files
+        .get(view.selected)
+        .map(|file| safe_text(&file.path.to_string_lossy()))
+        .unwrap_or_default();
+    let path_lines = if view.show_tree {
+        Vec::new()
+    } else {
+        wrap_path(&full_path, area.width.saturating_sub(2))
+    };
     let rows = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(
+            (2 + path_lines.len()).min(usize::from(area.height.saturating_sub(5))) as u16,
+        ),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
@@ -723,18 +1074,30 @@ fn draw_commit(theme: &Theme, frame: &mut Frame, view: &crate::app::CommitView, 
     };
     frame.render_widget(
         Paragraph::new(format!(
-            " {} {}\n {} · {} · {}{}",
+            " {} {}\n {} · {} · {}{}{}",
             &view.commit.oid[..10],
             safe_text(&view.commit.subject),
             parent,
             layout,
-            path,
-            matches
+            if view.show_tree { path } else { String::new() },
+            matches,
+            if path_lines.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", path_lines.join("\n"))
+            }
         ))
         .style(Style::default().fg(theme.muted)),
         rows[0],
     );
-    let panes = split(rows[1], 32);
+    let geometry = pane_geometry(
+        rows[1],
+        app.pane_percent(Some(PaneKind::Commit), area.width >= 100),
+        view.show_tree,
+        Some(PaneKind::Commit),
+    );
+    let panes = [geometry.list, geometry.preview];
+    *app.geometry.borrow_mut() = geometry;
     let items = view
         .history
         .tree
@@ -771,7 +1134,8 @@ fn draw_commit(theme: &Theme, frame: &mut Frame, view: &crate::app::CommitView, 
             }
         })
         .collect::<Vec<_>>();
-    let mut state = ListState::default().with_selected(if items.is_empty() {
+    let mut state = view.list_state.borrow_mut();
+    state.select(if items.is_empty() {
         None
     } else {
         Some(view.history.tree.cursor)
@@ -786,8 +1150,26 @@ fn draw_commit(theme: &Theme, frame: &mut Frame, view: &crate::app::CommitView, 
             .highlight_symbol("› ")
             .highlight_style(Style::default().bg(theme.selection).fg(theme.text).bold()),
         panes[0],
-        &mut state,
+        &mut *state,
     );
+    app.geometry.borrow_mut().rows = (state.offset()..view.history.tree.rows.len())
+        .take(usize::from(panes[0].height.saturating_sub(2)))
+        .collect();
+    if !panes[0].is_empty() {
+        let mut geometry = app.geometry.borrow_mut();
+        geometry.disclosures = geometry
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(line, index)| {
+                let row = view.history.tree.rows.get(*index)?;
+                row.file.is_none().then_some((
+                    panes[0].x + 3 + (row.depth.min(32) * 2) as u16,
+                    panes[0].y + 1 + line as u16,
+                ))
+            })
+            .collect();
+    }
     if view.history.loading {
         frame.render_widget(
             Paragraph::new("Loading file…").block(panel(theme, " File preview ".into(), true)),
@@ -883,7 +1265,22 @@ fn draw_commit(theme: &Theme, frame: &mut Frame, view: &crate::app::CommitView, 
             panes[1],
         );
     }
-    let footer = if let Some(input) = &search.editing {
+    let footer = if view.filter_editing || !view.history.tree.filter.is_empty() {
+        vec![
+            Line::raw(format!(
+                "/ filter files: {}{} · {} matches",
+                safe_text(&view.history.tree.filter),
+                if view.filter_editing { "▏" } else { "" },
+                view.history
+                    .tree
+                    .rows
+                    .iter()
+                    .filter(|row| row.file.is_some())
+                    .count()
+            )),
+            Line::raw("Enter keep filter · Esc clear · Tab diff · / searches focused pane"),
+        ]
+    } else if let Some(input) = &search.editing {
         let input = format!("{}▏", safe_text(input));
         let offset = Span::raw(&input)
             .width()
@@ -907,11 +1304,11 @@ fn draw_commit(theme: &Theme, frame: &mut Frame, view: &crate::app::CommitView, 
                 },
                 safe_text(&search.query)
             )),
-            Line::raw("[/] file · d unified/split · t full · Tab focus · Esc back"),
+            Line::raw("[/] file · T tree · d unified/split · t full · Tab focus · Esc back"),
         ]
     } else {
         vec![
-            Line::raw("j/k move · h/l tree/scroll · Enter open · [/] file · Tab focus"),
+            Line::raw("j/k move · h/l tree/scroll · T tree · [/] file · Tab focus"),
             Line::raw("/ find · n/N match · {/} hunk · d split · t full · P parent · Esc back"),
         ]
     };
@@ -1220,6 +1617,34 @@ fn diff_text(theme: &Theme, text: &str) -> Text<'static> {
     Text::from(
         text.lines()
             .map(|line| {
+                if let Some((path, stat)) = line.rsplit_once('|') {
+                    let mut fields = stat.split_whitespace();
+                    let count = fields.next().unwrap_or("");
+                    let bars = fields.collect::<String>();
+                    if !line.starts_with(['+', '-'])
+                        && !count.is_empty()
+                        && count.bytes().all(|byte| byte.is_ascii_digit())
+                        && !bars.is_empty()
+                        && bars.bytes().all(|byte| matches!(byte, b'+' | b'-'))
+                    {
+                        let mut spans = vec![Span::styled(
+                            format!("{}|", safe_text(path)),
+                            Style::default().fg(theme.text),
+                        )];
+                        for character in stat.chars() {
+                            let color = match character {
+                                '+' => theme.added,
+                                '-' => theme.deleted,
+                                _ => theme.text,
+                            };
+                            spans.push(Span::styled(
+                                character.to_string(),
+                                Style::default().fg(color),
+                            ));
+                        }
+                        return Line::from(spans);
+                    }
+                }
                 let color = if line.starts_with("+++") || line.starts_with("---") {
                     theme.muted
                 } else if line.starts_with('+') {
@@ -1252,20 +1677,6 @@ fn diff_window(theme: &Theme, text: &str, start: usize, height: u16) -> Text<'st
     )
 }
 
-fn split(area: Rect, left: u16) -> std::rc::Rc<[Rect]> {
-    Layout::default()
-        .direction(if area.width >= 100 {
-            Direction::Horizontal
-        } else {
-            Direction::Vertical
-        })
-        .constraints([
-            Constraint::Percentage(left),
-            Constraint::Percentage(100 - left),
-        ])
-        .split(area)
-}
-
 fn panel(theme: &Theme, title: String, focused: bool) -> Block<'static> {
     Block::bordered()
         .title(title)
@@ -1291,6 +1702,51 @@ pub fn safe_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diffstat_and_patch_signs_use_semantic_colors_in_all_presets() {
+        for name in crate::theme::PRESETS {
+            let theme = Theme::preset(name).unwrap();
+            let text = diff_text(
+                &theme,
+                " path/file | 8 ++++----\n+added\n-removed\n context\n file | Bin 1 -> 2 bytes\n",
+            );
+            let stats = &text.lines[0].spans;
+            assert!(
+                stats
+                    .iter()
+                    .any(|span| span.content == "+" && span.style.fg == Some(theme.added))
+            );
+            assert!(
+                stats
+                    .iter()
+                    .any(|span| span.content == "-" && span.style.fg == Some(theme.deleted))
+            );
+            assert_eq!(text.lines[1].style.fg, Some(theme.added));
+            assert_eq!(text.lines[2].style.fg, Some(theme.deleted));
+            assert_eq!(text.lines[3].style.fg, Some(theme.text));
+            assert_eq!(text.lines[4].style.fg, Some(theme.text));
+        }
+    }
+
+    #[test]
+    fn pane_geometry_clamps_sizes_and_hides_unneeded_dividers() {
+        for width in [44, 60, 100, 140] {
+            for percent in [0, 15, 32, 85, u16::MAX] {
+                let area = Rect::new(0, 4, width, 30);
+                let panes = pane_geometry(area, percent, true, Some(PaneKind::Files));
+                if width >= 100 {
+                    assert!(panes.list.width >= 20 && panes.preview.width >= 20);
+                } else {
+                    assert!(panes.list.height >= 3 && panes.preview.height >= 3);
+                }
+                assert!(panes.divider.width > 0 && panes.divider.height > 0);
+                let hidden = pane_geometry(area, percent, false, Some(PaneKind::Files));
+                assert_eq!(hidden.preview, area);
+                assert!(hidden.list.is_empty() && hidden.divider.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn search_highlights_whole_graphemes_and_long_lines_crop_without_u16_limits() {

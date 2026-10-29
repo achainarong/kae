@@ -13,7 +13,10 @@ use anyhow::Result;
 
 use crate::{
     conflict::Conflict,
-    git::{CommitFiles, FileChange, Guard, Hunks, Repo, Snapshot, Worktree},
+    git::{
+        CommitFiles, FileChange, Guard, Hunks, PREVIEW_LIMIT, RemoteBranch, Repo, Snapshot,
+        Worktree,
+    },
     history::HistoricalPreview,
     rebase::Plan,
 };
@@ -21,14 +24,33 @@ use crate::{
 #[derive(Clone)]
 pub enum Preview {
     File(FileChange),
-    Revision { revision: String, heading: String },
-    Remote { name: String, branch: String },
+    Folder {
+        heading: String,
+        files: Vec<FileChange>,
+    },
+    Revision {
+        revision: String,
+        heading: String,
+    },
+    Remote {
+        name: String,
+        branch: String,
+        folder: String,
+        branches: Vec<String>,
+        tracking: Vec<String>,
+    },
+    RemoteBranch {
+        branch: RemoteBranch,
+        head: Option<String>,
+    },
     Worktree(Worktree),
     Empty(String),
 }
 
 pub enum ReadKind {
-    Snapshot,
+    Snapshot {
+        all_history: bool,
+    },
     Preview(Preview),
     Conflict {
         path: PathBuf,
@@ -149,7 +171,7 @@ impl Loader {
         let (mutex, wake) = &*self.pending;
         let mut pending = mutex.lock().expect("loader queue lock");
         match request.kind {
-            ReadKind::Snapshot => pending.snapshot = Some(request),
+            ReadKind::Snapshot { .. } => pending.snapshot = Some(request),
             ReadKind::Preview(_) | ReadKind::CommitPreview { .. } => {
                 pending.preview = Some(request)
             }
@@ -179,20 +201,87 @@ impl Drop for Loader {
 
 fn execute(repo: Repo, kind: ReadKind) -> Result<ReadData> {
     Ok(match kind {
-        ReadKind::Snapshot => {
+        ReadKind::Snapshot { all_history } => {
             let repo = Repo::discover(&repo.root)?;
-            let snapshot = repo.snapshot()?;
+            let snapshot = if all_history {
+                repo.snapshot()?
+            } else {
+                repo.snapshot_scoped(false)?
+            };
             ReadData::Snapshot(Box::new((repo, snapshot)))
         }
         ReadKind::Preview(preview) => ReadData::Preview(match preview {
             Preview::File(file) => repo.file_preview(&file)?,
+            Preview::Folder { heading, files } => {
+                let mut text = format!("{heading}\n{} changed files\n", files.len());
+                for file in files {
+                    let preview = repo
+                        .file_preview(&file)
+                        .unwrap_or_else(|error| format!("Could not preview this file: {error:#}"));
+                    let section = format!("\n── {} ──\n\n{preview}\n", file.path.display());
+                    let remaining = PREVIEW_LIMIT.saturating_sub(text.len());
+                    if section.len() > remaining {
+                        let mut end = remaining;
+                        while !section.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        text.push_str(&section[..end]);
+                        text.push_str("\n[Combined preview truncated at 256 KiB; select a file to inspect it.]\n");
+                        break;
+                    }
+                    text.push_str(&section);
+                }
+                text
+            }
             Preview::Revision { revision, heading } => {
                 format!("{heading}\n\n{}", repo.show(&revision)?)
             }
-            Preview::Remote { name, branch } => format!(
-                "Remote: {name}\nCurrent branch: {branch}\n\n{}\n\nf fetch · p fast-forward pull · P push\n: for merge/rebase pull and upstream setup.\n\nAuthentication must already be configured.\nURLs are omitted to protect credentials.",
-                repo.text(&["status", "--short", "--branch"])?
+            Preview::Remote {
+                name,
+                branch,
+                folder,
+                branches,
+                tracking,
+            } => format!(
+                "Remote: {name}\nCurrent local branch: {branch}\nGroup: {folder}\n\n{} cached remote branches\n{}\n\nLocal tracking:\n{}\n\nf fetch (explicit confirmation) · select a branch to compare\nNetwork actions are never triggered by browsing.\nURLs are omitted to protect credentials.",
+                branches.len(),
+                branches.join("\n"),
+                if tracking.is_empty() {
+                    "No local branches tracking this remote.".into()
+                } else {
+                    tracking.join("\n")
+                }
             ),
+            Preview::RemoteBranch { branch, head } => {
+                let log = repo.text(&["log", "-10", "--format=%h %s", &branch.oid, "--"])?;
+                let comparison = if let Some(head) = head {
+                    format!(
+                        "HEAD-only / remote-only commits: {}\n\n{}",
+                        repo.text(&[
+                            "rev-list",
+                            "--left-right",
+                            "--count",
+                            &format!("{head}...{}", branch.oid),
+                            "--"
+                        ])?,
+                        repo.text(&[
+                            "diff",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--stat",
+                            &head,
+                            &branch.oid,
+                            "--"
+                        ])?
+                    )
+                } else {
+                    "Current branch has no commits to compare.".into()
+                };
+                format!(
+                    "Remote: {}\nBranch: {}\nCommit: {}\n\nLatest commits\n{log}\n\nCompared with current HEAD\n{comparison}\n\nf fetch · p pull this branch · P review push destination\nBrowsing uses cached refs; fetch explicitly to update them.",
+                    branch.remote, branch.branch, branch.oid
+                )
+            }
             Preview::Worktree(worktree) => format!(
                 "{}\nBranch: {}\nLocked: {}\n\nEnter to open · : for worktree actions\n\n{}",
                 worktree.path.display(),

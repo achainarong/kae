@@ -1,4 +1,6 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
@@ -11,7 +13,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::DefaultTerminal;
 
 use crate::{
@@ -19,12 +24,20 @@ use crate::{
     conflict::{Choice, Conflict},
     editor,
     git::{Action, CommitFiles, GitOutput, Hunks, Repo, Snapshot},
-    history::{DiffLayout, HistoricalPreview, History, Position, Preferences},
+    history::{DiffLayout, Document, HistoricalPreview, History, Position, Preferences, Search},
     loader::{Loader, Preview, ReadData, ReadKind, Request},
     rebase::{Plan, RebaseAction},
     theme::Theme,
     tree, ui,
 };
+
+struct MouseCapture;
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), event::DisableMouseCapture);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Workspace {
@@ -118,6 +131,7 @@ pub enum CommandId {
     Review,
     Log,
     Theme,
+    ToggleTree,
 }
 
 impl CommandId {
@@ -125,16 +139,14 @@ impl CommandId {
         use CommandId::*;
         // Exhaustive on purpose: a new command must make an explicit safety decision.
         match self {
-            Unstage | UnstageAll | Amend | Discard | TakeCurrent | TakeIncoming
-            | DeleteConflict | BranchRename | BranchDelete | Merge | CherryPick | Revert
-            | Fetch | PullFF | PullMerge | PullRebase | Push | PushUpstream | StashSave
-            | StashApply | StashPop | StashDrop | TagDelete | WorktreeRemove | Continue | Skip
-            | Abort => true,
-            // Hunk application, rebase execution, saves, and staged-version
-            // replacement have their own contextual confirmation steps.
-            Stage | StageAll | Hunks | Commit | Edit | Resolve | BranchCreate | BranchSwitch
-            | Compare | MergePreview | Rebase | TagCreate | WorktreeAdd | WorktreeOpen | Review
-            | Log | Theme => false,
+            Amend | Discard | TakeCurrent | TakeIncoming | DeleteConflict | BranchRename
+            | BranchDelete | Merge | CherryPick | Revert | Fetch | PullFF | PullMerge
+            | PullRebase | Push | PushUpstream | StashSave | StashApply | StashPop | StashDrop
+            | TagDelete | WorktreeRemove | Continue | Skip | Abort => true,
+            // Rebase execution and saves have contextual confirmation steps.
+            Stage | Unstage | StageAll | UnstageAll | Hunks | Commit | Edit | Resolve
+            | BranchCreate | BranchSwitch | Compare | MergePreview | Rebase | TagCreate
+            | WorktreeAdd | WorktreeOpen | Review | Log | Theme | ToggleTree => false,
         }
     }
     pub const ALL: [Self; 42] = [
@@ -184,6 +196,7 @@ impl CommandId {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::ToggleTree => "Toggle file tree",
             Self::Theme => "Change theme",
             Self::Stage => "Stage selected file / folder",
             Self::Unstage => "Unstage selected file / folder",
@@ -234,6 +247,7 @@ impl CommandId {
     pub fn available(self, app: &App) -> bool {
         use CommandId::*;
         match self {
+            ToggleTree => app.workspace == Workspace::Files,
             Stage | Unstage => app.workspace == Workspace::Files && !app.snapshot.files.is_empty(),
             Hunks | Discard | Edit => app.workspace == Workspace::Files && app.file_selected(),
             Resolve | TakeCurrent | TakeIncoming | DeleteConflict => {
@@ -283,6 +297,9 @@ pub enum Task {
 }
 
 pub struct CommitView {
+    pub filter_editing: bool,
+    pub show_tree: bool,
+    pub list_state: RefCell<ratatui::widgets::ListState>,
     pub commit: CommitFiles,
     pub selected: usize,
     pub focus: Focus,
@@ -302,7 +319,11 @@ impl CommitView {
             .and_then(|row| row.file)
             .unwrap_or(0);
         let mut full = false;
-        let mut focus = Focus::List;
+        let mut focus = if commit.files.len() == 1 {
+            Focus::Preview
+        } else {
+            Focus::List
+        };
         if let Some(preferences) = preferences {
             selected = preferences
                 .active
@@ -321,6 +342,9 @@ impl CommitView {
             };
         }
         Self {
+            filter_editing: false,
+            show_tree: commit.files.len() != 1,
+            list_state: RefCell::new(ratatui::widgets::ListState::default()),
             commit,
             selected,
             focus,
@@ -374,6 +398,35 @@ impl CommitView {
         self.selected = index;
         self.history.tree.select_file(index);
         true
+    }
+
+    fn edit_filter(&mut self, key: KeyEvent) -> bool {
+        let mut query = self.history.tree.filter.clone();
+        match key.code {
+            KeyCode::Esc => {
+                query.clear();
+                self.filter_editing = false;
+            }
+            KeyCode::Enter => self.filter_editing = false,
+            KeyCode::Backspace => {
+                query.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => query.clear(),
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !character.is_control()
+                    && query.len() + character.len_utf8() <= 1024 =>
+            {
+                query.push(character)
+            }
+            _ => return false,
+        }
+        self.history.tree.set_filter(&query);
+        self.history
+            .tree
+            .selected()
+            .and_then(|row| row.file)
+            .is_some_and(|index| self.select(index))
     }
 
     fn start_loading(&mut self) {
@@ -531,6 +584,21 @@ struct WorkerResult {
 }
 
 pub struct App {
+    pub remote_tree: crate::history::FileTree,
+    pub filters: [ListFilter; 7],
+    pub preview_search: Search,
+    pub geometry: RefCell<ui::PaneGeometry>,
+    pub tab_hits: RefCell<Vec<(ratatui::layout::Rect, Workspace)>>,
+    pub list_state: RefCell<ratatui::widgets::ListState>,
+    pub file_tree_override: Option<bool>,
+    pub pending_staging: HashMap<PathBuf, bool>,
+    dragging: bool,
+    layout_save: Option<Instant>,
+    pub history_graph: bool,
+    pub history_all: bool,
+    pub mouse_position: Option<(u16, u16)>,
+    pub show_path: bool,
+    pub explorer_state: RefCell<ratatui::widgets::ListState>,
     pub repo: Repo,
     pub snapshot: Snapshot,
     pub workspace: Workspace,
@@ -553,7 +621,7 @@ pub struct App {
     pub config: Config,
     pub config_root: Option<PathBuf>,
     pub explorer: crate::history::FileTree,
-    history_preferences: Option<Preferences>,
+    history_preferences: Option<(Preferences, bool)>,
     loader: Loader,
     next_read: u64,
     snapshot_read: Option<u64>,
@@ -567,7 +635,378 @@ pub struct App {
     quit: bool,
 }
 
+#[derive(Clone, Default)]
+pub struct ListFilter {
+    pub query: String,
+    pub editing: bool,
+}
+
 impl App {
+    pub fn visible_items(&self) -> Vec<(usize, String)> {
+        let query = self.filters[self.workspace.index()].query.to_lowercase();
+        self.items()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                matches!(self.workspace, Workspace::Files | Workspace::Remotes)
+                    || item.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn apply_filter(&mut self) {
+        let query = self.filters[self.workspace.index()].query.clone();
+        match self.workspace {
+            Workspace::Files => {
+                self.explorer.set_filter(&query);
+                if let Some(index) = self.explorer.selected().and_then(|row| row.file) {
+                    self.selected = index;
+                }
+            }
+            Workspace::Remotes => {
+                self.remote_tree.set_filter(&query);
+                self.selected = self.remote_tree.cursor;
+            }
+            _ => {
+                let indices = self
+                    .visible_items()
+                    .into_iter()
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                if !indices.contains(&self.selected) {
+                    self.selected = indices.first().copied().unwrap_or_else(|| {
+                        if self.items().is_empty() {
+                            0
+                        } else {
+                            usize::MAX
+                        }
+                    });
+                }
+            }
+        }
+        self.load_preview();
+    }
+
+    fn edit_filter(&mut self, key: KeyEvent) {
+        let filter = &mut self.filters[self.workspace.index()];
+        match key.code {
+            KeyCode::Esc => {
+                filter.query.clear();
+                filter.editing = false;
+            }
+            KeyCode::Enter => filter.editing = false,
+            KeyCode::Backspace => {
+                filter.query.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                filter.query.clear()
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !character.is_control()
+                    && filter.query.len() + character.len_utf8() <= 1024 =>
+            {
+                filter.query.push(character)
+            }
+            _ => return,
+        }
+        self.apply_filter();
+    }
+
+    fn edit_preview_search(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.preview_search.editing = None;
+                self.preview_search.query.clear();
+                self.preview_search
+                    .reindex(&Document::full(&self.preview), usize::from(self.scroll));
+            }
+            KeyCode::Enter => {
+                self.preview_search
+                    .accept(&Document::full(&self.preview), usize::from(self.scroll));
+                self.jump_preview_match();
+            }
+            KeyCode::Backspace => {
+                if let Some(input) = &mut self.preview_search.editing {
+                    input.pop();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = &mut self.preview_search.editing {
+                    input.clear();
+                }
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && !character.is_control() =>
+            {
+                if let Some(input) = &mut self.preview_search.editing
+                    && input.len() + character.len_utf8() <= 1024
+                {
+                    input.push(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn jump_preview_match(&mut self) {
+        if let Some(matched) = self.preview_search.current() {
+            self.scroll = matched.line.min(usize::from(u16::MAX)) as u16;
+            if let Some(line) = self.preview.lines().nth(matched.line) {
+                self.horizontal =
+                    ratatui::text::Span::raw(ui::safe_text(&line[..matched.bytes.start]))
+                        .width()
+                        .saturating_sub(8)
+                        .min(usize::from(u16::MAX)) as u16;
+            }
+        }
+    }
+
+    pub fn selected_remote_branch(&self) -> Option<&crate::git::RemoteBranch> {
+        self.remote_tree
+            .selected()
+            .and_then(|row| row.file)
+            .and_then(|index| self.snapshot.remote_branches.get(index))
+    }
+
+    fn selected_remote(&self) -> Option<&String> {
+        if let Some(branch) = self.selected_remote_branch() {
+            return self
+                .snapshot
+                .remotes
+                .iter()
+                .find(|remote| **remote == branch.remote);
+        }
+        let row = self.remote_tree.selected()?;
+        self.snapshot
+            .remotes
+            .iter()
+            .filter(|remote| row.path.starts_with(Path::new(remote)))
+            .max_by_key(|remote| remote.len())
+    }
+
+    pub fn files_tree_visible(&self) -> bool {
+        !self.filters[Workspace::Files.index()].query.is_empty()
+            || self.snapshot.files.is_empty()
+            || self
+                .file_tree_override
+                .unwrap_or(self.snapshot.files.len() != 1)
+    }
+
+    fn toggle_file_tree(&mut self) {
+        self.file_tree_override = Some(!self.files_tree_visible());
+        if !self.files_tree_visible() {
+            self.explorer.select_file(self.selected);
+            self.focus = Focus::Preview;
+            self.load_preview();
+        } else {
+            self.focus = Focus::List;
+        }
+    }
+
+    pub fn pane_percent(&self, kind: Option<ui::PaneKind>, horizontal: bool) -> u16 {
+        let panes = &self.config.panes;
+        match (kind, horizontal) {
+            (Some(ui::PaneKind::Files), true) => panes.files_width,
+            (Some(ui::PaneKind::History), true) => panes.history_width,
+            (Some(ui::PaneKind::Commit), true) => panes.commit_width,
+            (Some(ui::PaneKind::Files), false) => panes.files_height,
+            (Some(ui::PaneKind::History), false) => panes.history_height,
+            (Some(ui::PaneKind::Commit), false) => panes.commit_height,
+            _ => 32,
+        }
+        .clamp(15, 85)
+    }
+
+    fn resize_pane(&mut self, kind: Option<ui::PaneKind>, horizontal: bool, percent: u16) {
+        let panes = &mut self.config.panes;
+        let value = match (kind, horizontal) {
+            (Some(ui::PaneKind::Files), true) => &mut panes.files_width,
+            (Some(ui::PaneKind::History), true) => &mut panes.history_width,
+            (Some(ui::PaneKind::Commit), true) => &mut panes.commit_width,
+            (Some(ui::PaneKind::Files), false) => &mut panes.files_height,
+            (Some(ui::PaneKind::History), false) => &mut panes.history_height,
+            (Some(ui::PaneKind::Commit), false) => &mut panes.commit_height,
+            _ => return,
+        };
+        *value = percent.clamp(15, 85);
+        self.mouse_position = None;
+        self.layout_save = Some(Instant::now());
+    }
+
+    fn save_layout(&mut self) {
+        self.layout_save = None;
+        if let Some(root) = &self.config_root {
+            if let Err(error) = Config::save_panes(root, &self.config.panes) {
+                self.error = Some(format!(
+                    "Pane sizes apply this session, but could not be saved: {error:#}"
+                ));
+            }
+        } else {
+            self.notice = "Pane sizes apply this session; HOME/XDG_CONFIG_HOME is unset.".into();
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.modal.is_some() && !matches!(self.modal, Some(Modal::Commit(_))) {
+            return;
+        }
+        let geometry = self.geometry.borrow().clone();
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        if self.modal.is_none() && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            let workspace = self
+                .tab_hits
+                .borrow()
+                .iter()
+                .find(|(area, _)| area.contains(position))
+                .map(|(_, workspace)| *workspace);
+            if let Some(workspace) = workspace {
+                self.switch(workspace);
+                return;
+            }
+        }
+        match mouse.kind {
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.dragging {
+                    self.dragging = false;
+                    self.save_layout();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                let horizontal = geometry.area.width >= 100;
+                let (coordinate, start, total) = if horizontal {
+                    (mouse.column, geometry.area.x, geometry.area.width)
+                } else {
+                    (mouse.row, geometry.area.y, geometry.area.height)
+                };
+                if total > 0 {
+                    self.resize_pane(
+                        geometry.kind,
+                        horizontal,
+                        (u32::from(coordinate.saturating_sub(start)) * 100 / u32::from(total))
+                            .min(100) as u16,
+                    );
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if geometry.kind.is_some() && geometry.divider.contains(position) =>
+            {
+                self.dragging = true;
+                self.mouse_position = None;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_position = None;
+                self.filters[self.workspace.index()].editing = false;
+                let inner = geometry.list.inner(ratatui::layout::Margin::new(1, 1));
+                let row = if inner.contains(position) {
+                    geometry.rows.get(usize::from(mouse.row - inner.y)).copied()
+                } else {
+                    None
+                };
+                if let Some(Modal::Commit(view)) = &mut self.modal {
+                    view.filter_editing = false;
+                    if geometry.preview.contains(position) {
+                        view.focus = Focus::Preview;
+                    }
+                    if let Some(row) = row {
+                        view.focus = Focus::List;
+                        view.history.tree.cursor = row;
+                        if let Some(index) = view.history.tree.selected().and_then(|row| row.file) {
+                            if view.select(index) {
+                                self.load_commit_preview();
+                            }
+                        } else if geometry.disclosures.contains(&(mouse.column, mouse.row)) {
+                            view.history.tree.toggle();
+                        }
+                    }
+                } else if let Some(row) = row {
+                    self.focus = Focus::List;
+                    if self.workspace == Workspace::Files {
+                        self.explorer.cursor = row;
+                        if let Some(index) = self.explorer.selected().and_then(|row| row.file) {
+                            self.selected = index;
+                        } else if geometry.disclosures.contains(&(mouse.column, mouse.row)) {
+                            self.explorer.toggle();
+                        }
+                    } else if self.workspace == Workspace::Remotes {
+                        self.remote_tree.cursor = row;
+                        self.selected = row;
+                        if geometry.disclosures.contains(&(mouse.column, mouse.row)) {
+                            self.remote_tree.toggle();
+                            self.selected = self.remote_tree.cursor;
+                        }
+                    } else {
+                        self.selected = row;
+                    }
+                    self.load_preview();
+                } else if geometry.preview.contains(position) {
+                    self.focus = Focus::Preview;
+                }
+            }
+            MouseEventKind::Moved if !self.dragging => {
+                self.show_path = false;
+                self.mouse_position = Some((mouse.column, mouse.row));
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                if !geometry.list.contains(position) && !geometry.preview.contains(position) {
+                    return;
+                }
+                let down = mouse.kind == MouseEventKind::ScrollDown;
+                let code = if down { KeyCode::Down } else { KeyCode::Up };
+                if let Some(Modal::Commit(view)) = &mut self.modal {
+                    view.focus = if geometry.preview.contains(position) {
+                        Focus::Preview
+                    } else {
+                        Focus::List
+                    };
+                    for _ in 0..3 {
+                        self.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+                    }
+                } else {
+                    self.focus = if geometry.preview.contains(position) {
+                        Focus::Preview
+                    } else {
+                        Focus::List
+                    };
+                    self.navigate(if down { 3 } else { -3 });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn optimistic_staging(&mut self, task: &Task) {
+        self.pending_staging.clear();
+        if let Task::Hunk(hunks) = task {
+            self.pending_staging
+                .insert(hunks.path.clone(), !hunks.cached);
+            return;
+        }
+        let Task::Git(action) = task else {
+            return;
+        };
+        if !action.updates_only_index() {
+            return;
+        }
+        let staged = action.args.first().is_some_and(|arg| arg == "add");
+        let paths = action
+            .args
+            .iter()
+            .position(|arg| arg == "--")
+            .map(|index| &action.args[index + 1..]);
+        for file in &self.snapshot.files {
+            if paths.is_none_or(|paths| {
+                paths.iter().any(|path| {
+                    path == "."
+                        || Path::new(path) == file.path
+                        || file.original.as_deref() == Some(Path::new(path))
+                })
+            }) {
+                self.pending_staging.insert(file.path.clone(), staged);
+            }
+        }
+    }
+
     pub fn new(path: &Path) -> Result<Self> {
         let repo = Repo {
             root: std::env::current_dir()?.join(path),
@@ -592,6 +1031,21 @@ impl App {
             }
         };
         let mut app = Self {
+            remote_tree: tree::remotes(&snapshot),
+            filters: std::array::from_fn(|_| ListFilter::default()),
+            preview_search: Search::default(),
+            geometry: RefCell::new(ui::PaneGeometry::default()),
+            tab_hits: RefCell::new(Vec::new()),
+            list_state: RefCell::new(ratatui::widgets::ListState::default()),
+            file_tree_override: None,
+            pending_staging: HashMap::new(),
+            dragging: false,
+            layout_save: None,
+            history_graph: false,
+            history_all: false,
+            mouse_position: None,
+            show_path: false,
+            explorer_state: RefCell::new(ratatui::widgets::ListState::default()),
             repo,
             snapshot,
             workspace: Workspace::Files,
@@ -654,6 +1108,8 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
+        let _mouse = MouseCapture;
         let paste = editor::PasteMode::enable()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         for signal in [
@@ -667,6 +1123,14 @@ impl App {
         while !self.quit {
             redraw |= self.poll_worker();
             redraw |= self.poll_loading();
+            if self
+                .layout_save
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(350))
+                && !self.dragging
+            {
+                self.save_layout();
+                redraw = true;
+            }
             self.auto_refresh(Instant::now());
             if shutdown.load(Ordering::Relaxed) && !self.quit_requested {
                 self.quit_requested = true;
@@ -677,11 +1141,13 @@ impl App {
                 continue;
             }
             if let Some(path) = self.edit_path.take() {
+                crossterm::execute!(std::io::stdout(), event::DisableMouseCapture)?;
                 paste.suspend()?;
                 ratatui::restore();
                 let result = editor::open(&path);
                 *terminal = ratatui::init();
                 paste.resume()?;
+                crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
                 terminal.clear()?;
                 if let Err(error) = result {
                     self.fail(error);
@@ -721,16 +1187,17 @@ impl App {
                         }
                     }
                     Event::Resize(width, _) => {
+                        self.dragging = false;
+                        self.mouse_position = None;
                         self.update_width(width);
                     }
-                    Event::Mouse(mouse) if self.modal.is_none() => match mouse.kind {
-                        event::MouseEventKind::ScrollDown => self.navigate(3),
-                        event::MouseEventKind::ScrollUp => self.navigate(-3),
-                        _ => {}
-                    },
+                    Event::Mouse(mouse) => self.handle_mouse(mouse),
                     _ => {}
                 }
             }
+        }
+        if self.layout_save.is_some() {
+            self.save_layout();
         }
         Ok(())
     }
@@ -770,6 +1237,12 @@ impl App {
                 .commits
                 .iter()
                 .map(|commit| {
+                    if !self.history_graph {
+                        return format!(
+                            "{} {} · {} · {}",
+                            commit.subject, commit.refs, commit.short, commit.age
+                        );
+                    }
                     let mut row = format!(
                         "{}{} {} {}",
                         commit.graph, commit.short, commit.subject, commit.refs
@@ -794,7 +1267,30 @@ impl App {
                     )
                 })
                 .collect(),
-            Workspace::Remotes => self.snapshot.remotes.clone(),
+            Workspace::Remotes => self
+                .remote_tree
+                .rows
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{}{} {}{}",
+                        "  ".repeat(row.depth),
+                        if row.file.is_some() {
+                            " "
+                        } else if self.remote_tree.collapsed.contains(&row.path) {
+                            "▸"
+                        } else {
+                            "▾"
+                        },
+                        row.name.to_string_lossy(),
+                        if row.file.is_none() {
+                            format!("/ ({})", row.count)
+                        } else {
+                            String::new()
+                        }
+                    )
+                })
+                .collect(),
             Workspace::Stashes => self
                 .snapshot
                 .stashes
@@ -823,6 +1319,7 @@ impl App {
             .into_iter()
             .chain([CommandId::Log])
             .chain([CommandId::Theme])
+            .chain([CommandId::ToggleTree])
             .filter(|command| {
                 command.available(self)
                     && command
@@ -834,6 +1331,14 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.dragging {
+            self.dragging = false;
+            self.save_layout();
+        }
+        self.mouse_position = None;
+        if key.code != KeyCode::Char('w') {
+            self.show_path = false;
+        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.busy.is_some() {
                 self.quit_requested = true;
@@ -848,6 +1353,58 @@ impl App {
                 self.quit = true;
             }
             return;
+        }
+        if self.modal.is_none() && self.filters[self.workspace.index()].editing {
+            self.edit_filter(key);
+            return;
+        }
+        if self.modal.is_none() && self.preview_search.editing.is_some() {
+            self.edit_preview_search(key);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+            )
+        {
+            let horizontal = matches!(key.code, KeyCode::Left | KeyCode::Right);
+            let geometry = self.geometry.borrow().clone();
+            if (self.modal.is_none() || matches!(self.modal, Some(Modal::Commit(_))))
+                && geometry.kind.is_some()
+                && geometry.divider.width > 0
+                && horizontal == (geometry.area.width >= 100)
+            {
+                let amount = if matches!(key.code, KeyCode::Left | KeyCode::Up) {
+                    -2
+                } else {
+                    2
+                };
+                self.resize_pane(
+                    geometry.kind,
+                    horizontal,
+                    self.pane_percent(geometry.kind, horizontal)
+                        .saturating_add_signed(amount),
+                );
+                return;
+            }
+        }
+        if key.code == KeyCode::Char('T') {
+            if let Some(Modal::Commit(view)) = &mut self.modal
+                && view.history.search.editing.is_none()
+                && !view.filter_editing
+            {
+                view.show_tree = !view.show_tree;
+                view.focus = if view.show_tree {
+                    Focus::List
+                } else {
+                    Focus::Preview
+                };
+                return;
+            } else if self.modal.is_none() && self.workspace == Workspace::Files {
+                self.toggle_file_tree();
+                return;
+            }
         }
         if let Some(modal) = self.modal.take() {
             self.handle_modal(modal, key);
@@ -865,6 +1422,7 @@ impl App {
                 KeyCode::Char('?')
                     | KeyCode::Char('1'..='7')
                     | KeyCode::Char('[' | ']' | 'j' | 'k' | 'h' | 'l')
+                    | KeyCode::Char('/' | 'n' | 'N')
                     | KeyCode::Up
                     | KeyCode::Down
                     | KeyCode::Left
@@ -886,11 +1444,24 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.modal = Some(Modal::Help { scroll: 0 }),
             KeyCode::Char('!') => self.output("Last error / operation", self.last_output.clone()),
-            KeyCode::Char(':') | KeyCode::Char('/') => {
+            KeyCode::Char(':') => {
                 self.modal = Some(Modal::Palette {
                     filter: String::new(),
                     selected: 0,
                 })
+            }
+            KeyCode::Char('/') => {
+                if self.focus == Focus::Preview {
+                    self.preview_search.begin();
+                } else {
+                    self.filters[self.workspace.index()].editing = true;
+                }
+            }
+            KeyCode::Char('n' | 'N')
+                if self.focus == Focus::Preview && !self.preview_search.query.is_empty() =>
+            {
+                self.preview_search.next(key.code == KeyCode::Char('N'));
+                self.jump_preview_match();
             }
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char(']') => self.switch(self.workspace.next(false)),
@@ -899,7 +1470,9 @@ impl App {
                 self.switch(Workspace::ALL[number as usize - '1' as usize])
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                self.focus = if self.focus == Focus::List {
+                self.focus = if (self.workspace == Workspace::Files && !self.files_tree_visible())
+                    || self.focus == Focus::List
+                {
                     Focus::Preview
                 } else {
                     Focus::List
@@ -907,6 +1480,20 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.navigate(1),
             KeyCode::Up | KeyCode::Char('k') => self.navigate(-1),
+            KeyCode::Left | KeyCode::Char('h')
+                if self.workspace == Workspace::Remotes && self.focus == Focus::List =>
+            {
+                self.remote_tree.collapse();
+                self.selected = self.remote_tree.cursor;
+                self.load_preview();
+            }
+            KeyCode::Right | KeyCode::Char('l')
+                if self.workspace == Workspace::Remotes && self.focus == Focus::List =>
+            {
+                self.remote_tree.expand();
+                self.selected = self.remote_tree.cursor;
+                self.load_preview();
+            }
             KeyCode::Char('h') | KeyCode::Left
                 if self.workspace == Workspace::Files && self.focus == Focus::List =>
             {
@@ -949,15 +1536,48 @@ impl App {
                         if let Some(index) = self.explorer.navigate(isize::MIN) {
                             self.selected = index;
                         }
+                    } else if self.workspace == Workspace::Remotes {
+                        self.remote_tree.navigate(isize::MIN);
+                        self.selected = self.remote_tree.cursor;
                     } else {
-                        self.selected = 0;
+                        self.selected = self
+                            .visible_items()
+                            .first()
+                            .map(|(index, _)| *index)
+                            .unwrap_or_else(|| {
+                                if self.items().is_empty() {
+                                    0
+                                } else {
+                                    usize::MAX
+                                }
+                            });
                     }
                     self.load_preview();
                 }
             }
-            KeyCode::Esc => self.error = None,
+            KeyCode::Char('w') if self.workspace == Workspace::Files => {
+                self.show_path = !self.show_path;
+            }
+            KeyCode::Char('g') if self.workspace == Workspace::History => {
+                self.history_graph = !self.history_graph;
+            }
+            KeyCode::Char('B') if self.workspace == Workspace::History && self.busy.is_none() => {
+                self.history_all = !self.history_all;
+                self.snapshot_read = Some(self.read(ReadKind::Snapshot {
+                    all_history: self.history_all,
+                }));
+            }
+            KeyCode::Esc => {
+                self.error = None;
+                if !self.filters[self.workspace.index()].query.is_empty() {
+                    self.filters[self.workspace.index()].query.clear();
+                    self.apply_filter();
+                }
+                self.preview_search = Search::default();
+            }
             KeyCode::Char(' ')
-                if self.workspace == Workspace::Files && self.focus == Focus::List =>
+                if self.workspace == Workspace::Files
+                    && (self.focus == Focus::List || !self.files_tree_visible()) =>
             {
                 self.toggle_staging();
             }
@@ -988,6 +1608,11 @@ impl App {
             KeyCode::Char('A') => self.invoke(CommandId::Abort),
             KeyCode::Char('~') => self.invoke(CommandId::Log),
             KeyCode::Enter => match self.workspace {
+                Workspace::Remotes if self.focus == Focus::List => {
+                    self.remote_tree.toggle();
+                    self.selected = self.remote_tree.cursor;
+                    self.load_preview();
+                }
                 Workspace::Files if self.focus == Focus::List && !self.file_selected() => {
                     self.explorer.toggle();
                     self.load_preview();
@@ -1390,8 +2015,21 @@ impl App {
                 self.modal = Some(Modal::Inline { conflict, editor });
             }
             Modal::Commit(mut view) => {
+                if view.filter_editing {
+                    let reload = view.edit_filter(key);
+                    self.modal = Some(Modal::Commit(view));
+                    if reload {
+                        self.load_commit_preview();
+                    }
+                    return;
+                }
                 if view.history.search.editing.is_some() {
                     view.edit_search(key, self.screen_width);
+                    self.modal = Some(Modal::Commit(view));
+                    return;
+                }
+                if key.code == KeyCode::Esc && !view.history.tree.filter.is_empty() {
+                    view.history.tree.set_filter("");
                     self.modal = Some(Modal::Commit(view));
                     return;
                 }
@@ -1404,7 +2042,7 @@ impl App {
                 let split = view.history.split(self.screen_width, view.full);
                 match key.code {
                     KeyCode::Tab | KeyCode::BackTab => {
-                        view.focus = if view.focus == Focus::List {
+                        view.focus = if !view.show_tree || view.focus == Focus::List {
                             Focus::Preview
                         } else {
                             Focus::List
@@ -1504,7 +2142,13 @@ impl App {
                             view.jump_to_match(self.screen_width);
                         }
                     }
-                    KeyCode::Char('/') => view.history.search.begin(),
+                    KeyCode::Char('/') => {
+                        if view.focus == Focus::List && view.show_tree {
+                            view.filter_editing = true;
+                        } else {
+                            view.history.search.begin();
+                        }
+                    }
                     KeyCode::Char('n') | KeyCode::Char('N') => {
                         view.history.search.next(key.code == KeyCode::Char('N'));
                         view.jump_to_match(self.screen_width);
@@ -1533,7 +2177,7 @@ impl App {
                         }
                     }
                     KeyCode::Char('P') if view.commit.parents.len() > 1 => {
-                        self.history_preferences = Some(view.preferences());
+                        self.history_preferences = Some((view.preferences(), view.show_tree));
                         self.commit_read = None;
                         self.detail(
                             ReadKind::Commit {
@@ -1577,14 +2221,7 @@ impl App {
                         hunks.horizontal = hunks.horizontal.saturating_add(4)
                     }
                     KeyCode::Char('s') => {
-                        self.modal = Some(Modal::Confirm {
-                            detail: format!(
-                                "{} selected hunk in {:?}?\nThe index is updated; working files are not changed.",
-                                if hunks.cached { "Unstage" } else { "Stage" },
-                                hunks.path
-                            ),
-                            task: Task::Hunk(*hunks),
-                        });
+                        self.start(Task::Hunk(*hunks));
                         return;
                     }
                     KeyCode::Tab => {
@@ -1668,16 +2305,27 @@ impl App {
     }
 
     fn switch(&mut self, workspace: Workspace) {
+        self.filters[self.workspace.index()].editing = false;
         self.workspace = workspace;
         self.selected = 0;
         if workspace == Workspace::Files {
             self.explorer.select_file(0);
         }
-        self.focus = Focus::List;
-        self.load_preview();
+        self.focus = if workspace == Workspace::Files && !self.files_tree_visible() {
+            Focus::Preview
+        } else {
+            Focus::List
+        };
+        self.preview_search = Search::default();
+        if workspace == Workspace::Remotes {
+            self.selected = self.remote_tree.cursor;
+        }
+        self.apply_filter();
     }
 
     fn navigate(&mut self, delta: isize) {
+        self.mouse_position = None;
+        self.show_path = false;
         if self.focus == Focus::Preview {
             self.scroll = self.scroll.saturating_add_signed(delta as i16).min(
                 self.preview
@@ -1694,10 +2342,34 @@ impl App {
                 self.load_preview();
                 return;
             }
-            self.selected = self
-                .selected
-                .saturating_add_signed(delta)
-                .min(self.items().len().saturating_sub(1));
+            if self.workspace == Workspace::Remotes {
+                self.remote_tree.navigate(delta);
+                self.selected = self.remote_tree.cursor;
+            } else {
+                let indices = self
+                    .visible_items()
+                    .into_iter()
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                let position = indices
+                    .iter()
+                    .position(|index| *index == self.selected)
+                    .unwrap_or(0);
+                self.selected = indices
+                    .get(
+                        position
+                            .saturating_add_signed(delta)
+                            .min(indices.len().saturating_sub(1)),
+                    )
+                    .copied()
+                    .unwrap_or_else(|| {
+                        if self.items().is_empty() {
+                            0
+                        } else {
+                            usize::MAX
+                        }
+                    });
+            }
             self.load_preview();
         }
     }
@@ -1777,37 +2449,17 @@ impl App {
             }
         }
         ensure!(!paths.is_empty(), "No staged files in this folder");
-        let detail = format!(
-            "{} folder {:?}?\n{} changed files; {} paths (including rename sources):\n{}\n\nWorking files are not deleted. Staging can replace previous staged-only content; unstaging can discard staged-only content.\nRename sources outside this folder are included explicitly.",
-            if command == CommandId::Stage {
-                "Stage"
-            } else {
-                "Unstage"
-            },
-            if row.path.as_os_str().is_empty() {
-                &self.repo.root
-            } else {
-                &row.path
-            },
-            files.len(),
-            paths.len(),
-            paths
-                .iter()
-                .map(|path| format!("  {:?}", path))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
         action
             .args
             .extend(paths.into_iter().map(|path| path.into_os_string()));
-        self.modal = Some(Modal::Confirm {
-            task: Task::Git(action),
-            detail,
-        });
+        self.start(Task::Git(action));
         Ok(())
     }
 
     fn preview_target(&self) -> Preview {
+        if self.workspace == Workspace::Files && self.explorer.rows.is_empty() {
+            return Preview::Empty("No files match the current filter. Esc clears it.".into());
+        }
         if self.workspace == Workspace::Files
             && !self.file_selected()
             && let Some(row) = self.explorer.selected()
@@ -1817,16 +2469,20 @@ impl App {
                     "Working tree is clean.\n\nPress 2 for history or : for commands.".into(),
                 );
             }
-            return Preview::Empty(format!(
-                "{}\n\n{} changed files\n\nEnter expand / collapse\ns stage changed files\nu review unstaging\n\nSelect a file to see its diff.",
-                if row.path.as_os_str().is_empty() {
-                    &self.repo.root
+            return Preview::Folder {
+                heading: if row.path.as_os_str().is_empty() {
+                    self.repo.root.display().to_string()
                 } else {
-                    &row.path
-                }
-                .display(),
-                row.count
-            ));
+                    row.path.display().to_string()
+                },
+                files: self
+                    .snapshot
+                    .files
+                    .iter()
+                    .filter(|file| file.path.starts_with(&row.path))
+                    .cloned()
+                    .collect(),
+            };
         }
         let empty = || Preview::Empty("Nothing here yet. Use : for commands.".into());
         match self.workspace {
@@ -1865,19 +2521,43 @@ impl App {
                     ),
                 })
                 .unwrap_or_else(empty),
-            Workspace::Remotes => self
-                .snapshot
-                .remotes
-                .get(self.selected)
-                .map(|remote| Preview::Remote {
-                    name: remote.clone(),
-                    branch: self.snapshot.branch.clone(),
-                })
-                .unwrap_or_else(|| {
-                    Preview::Empty(
-                        "No remotes configured. Add one with git remote add, then refresh.".into(),
-                    )
-                }),
+            Workspace::Remotes => {
+                if let Some(branch) = self.selected_remote_branch() {
+                    Preview::RemoteBranch {
+                        branch: branch.clone(),
+                        head: self.snapshot.head.clone(),
+                    }
+                } else if let Some(remote) = self.selected_remote() {
+                    let path = &self.remote_tree.selected().expect("remote selection").path;
+                    Preview::Remote {
+                        name: remote.clone(),
+                        branch: self.snapshot.branch.clone(),
+                        folder: path.display().to_string(),
+                        branches: self
+                            .snapshot
+                            .remote_branches
+                            .iter()
+                            .filter(|branch| {
+                                branch.remote == *remote
+                                    && Path::new(&format!("{}/{}", branch.remote, branch.branch))
+                                        .starts_with(path)
+                            })
+                            .map(|branch| format!("{}/{}", branch.remote, branch.branch))
+                            .collect(),
+                        tracking: self
+                            .snapshot
+                            .branches
+                            .iter()
+                            .filter(|branch| branch.upstream.starts_with(&format!("{remote}/")))
+                            .map(|branch| {
+                                format!("{} → {} {}", branch.name, branch.upstream, branch.tracking)
+                            })
+                            .collect(),
+                    }
+                } else {
+                    Preview::Empty("No matching remotes. Configure a remote with git remote add, or Esc to clear the filter.".into())
+                }
+            }
             Workspace::Stashes => self
                 .snapshot
                 .stashes
@@ -1924,11 +2604,10 @@ impl App {
                 .get(self.selected)
                 .map(|branch| branch.name.clone().into()),
             Workspace::Remotes => self
-                .snapshot
-                .remotes
+                .remote_tree
+                .rows
                 .get(self.selected)
-                .cloned()
-                .map(Into::into),
+                .map(|row| row.path.as_os_str().to_owned()),
             Workspace::Stashes => self
                 .snapshot
                 .stashes
@@ -1956,6 +2635,8 @@ impl App {
             self.scroll = 0;
             self.horizontal = 0;
             self.preview = "Loading preview…".into();
+            self.preview_search
+                .reindex(&Document::full(&self.preview), 0);
         }
         self.preview_loading = true;
         self.preview_read = Some(self.read(ReadKind::Preview(self.preview_target())));
@@ -1992,7 +2673,7 @@ impl App {
             .map(|branch| branch.upstream.as_str())
             .unwrap_or_default();
         let remote = if self.workspace == Workspace::Remotes {
-            self.snapshot.remotes.get(self.selected)
+            self.selected_remote()
         } else {
             self.snapshot
                 .remotes
@@ -2041,6 +2722,10 @@ impl App {
 
     fn prepare(&mut self, command: CommandId, input: Option<String>) -> Result<()> {
         use CommandId::*;
+        if command == ToggleTree {
+            self.toggle_file_tree();
+            return Ok(());
+        }
         if command == Theme {
             let root = self
                 .config_root
@@ -2074,7 +2759,7 @@ impl App {
         let mut confirm = false;
         let mut detail = command.label().to_owned();
         let action = match command {
-            Theme => unreachable!(),
+            Theme | ToggleTree => unreachable!(),
             Log => {
                 self.output("Last Git operation", self.last_output.clone());
                 return Ok(());
@@ -2167,13 +2852,7 @@ impl App {
                     .get(self.selected)
                     .context("Select a file")?;
                 let mut action = match command {
-                    Stage => {
-                        if !matches!(file.status.as_bytes()[0], b' ' | b'?') && file.status.as_bytes()[1] != b' ' {
-                            confirm = true;
-                            detail = format!("Replace the staged version of {:?} with its current working content?\nThe previous staged-only content may no longer be recoverable through normal Git history.", file.path);
-                        }
-                        new(&["add"])
-                    }
+                    Stage => new(&["add"]),
                     Unstage if self.snapshot.head.is_some() => new(&["restore", "--staged"]),
                     Unstage => new(&["rm", "--cached", "-f"]),
                     Discard => {
@@ -2199,13 +2878,10 @@ impl App {
                 action
             }
             StageAll => {
-                if self.snapshot.files.iter().any(|file| {
-                    !matches!(file.status.as_bytes()[0], b' ' | b'?')
-                        && file.status.as_bytes()[1] != b' '
-                }) {
-                    confirm = true;
-                    detail = "Stage all files, replacing any previously staged versions with working content?\nPrevious staged-only content can be lost. Working files are not deleted.".into();
-                }
+                ensure!(
+                    !self.snapshot.files.iter().any(|file| file.is_conflict()),
+                    "Resolve and stage conflicted files individually before staging all files"
+                );
                 new(&["add", "--all"])
             }
             UnstageAll if self.snapshot.head.is_some() => new(&["restore", "--staged", "--", "."]),
@@ -2309,12 +2985,16 @@ impl App {
             }
             Fetch | PullFF | PullMerge | PullRebase | Push | PushUpstream => {
                 let remote = self.remote()?;
+                let selected_branch = (self.workspace == Workspace::Remotes)
+                    .then(|| self.selected_remote_branch())
+                    .flatten()
+                    .map(|branch| branch.branch.clone());
                 detail = format!(
                     "{}\nRemote: {remote}\nBranch: {}\nNo force-push will be used.",
                     command.label(),
                     self.snapshot.branch
                 );
-                match command {
+                let mut action = match command {
                     Fetch => new(&["fetch", "--no-prune", "--no-prune-tags", "--", &remote]),
                     PullFF => {
                         confirm = true;
@@ -2359,7 +3039,9 @@ impl App {
                             .find(|branch| branch.current)
                             .map(|branch| branch.upstream.as_str())
                             .unwrap_or_default();
-                        let destination = if command == Push {
+                        let destination = if let Some(branch) = &selected_branch {
+                            branch.as_str()
+                        } else if command == Push {
                             upstream
                                 .strip_prefix(&format!("{remote}/"))
                                 .unwrap_or(&self.snapshot.branch)
@@ -2391,7 +3073,27 @@ impl App {
                         .idle()
                     }
                     _ => unreachable!(),
+                };
+                if matches!(command, PullFF | PullMerge | PullRebase) {
+                    let upstream = self
+                        .snapshot
+                        .branches
+                        .iter()
+                        .find(|branch| branch.current)
+                        .map(|branch| branch.upstream.as_str())
+                        .unwrap_or("");
+                    let branch = selected_branch
+                        .as_deref()
+                        .or_else(|| upstream.strip_prefix(&format!("{remote}/")))
+                        .unwrap_or(&self.snapshot.branch);
+                    ensure!(
+                        !self.snapshot.branch.starts_with("detached @"),
+                        "Switch to a local branch before pulling"
+                    );
+                    action.args.push(branch.into());
+                    detail.push_str(&format!("\nSource remote branch: {remote}/{branch}"));
                 }
+                action
             }
             StashApply | StashPop | StashDrop => {
                 let stash = self
@@ -2497,9 +3199,12 @@ impl App {
         if self.busy.is_some() {
             return;
         }
+        self.optimistic_staging(&task);
         self.cancel_reads();
         let repo = self.repo.clone();
-        let index_snapshot = matches!(&task, Task::Git(action) if action.updates_only_index())
+        let all_history = self.history_all;
+        let index_snapshot = (matches!(&task, Task::Git(action) if action.updates_only_index())
+            && self.snapshot.all_history == all_history)
             .then(|| self.snapshot.clone());
         let label = match &task {
             Task::Git(action) | Task::Preview(action) => action.label.clone(),
@@ -2534,7 +3239,7 @@ impl App {
             .map_err(|error| format!("{error:#}"));
             let snapshot = match index_snapshot {
                 Some(previous) => repo.refresh_index(&previous),
-                None => repo.snapshot(),
+                None => repo.snapshot_scoped(all_history),
             }
             .map_err(|error| format!("{error:#}"));
             let _ = sender.send(WorkerResult {
@@ -2551,6 +3256,7 @@ impl App {
         let result = match self.worker.as_ref().map(Receiver::try_recv) {
             Some(Ok(result)) => result,
             Some(Err(TryRecvError::Disconnected)) => {
+                self.pending_staging.clear();
                 self.busy = None;
                 self.worker = None;
                 self.error = Some("Git worker stopped unexpectedly. Refresh and inspect repository state before retrying.".into());
@@ -2560,6 +3266,7 @@ impl App {
         };
         self.busy = None;
         self.worker = None;
+        self.pending_staging.clear();
         match result.snapshot {
             Ok(snapshot) => self.apply_snapshot(self.repo.clone(), snapshot),
             Err(error) => self.error = Some(format!("Could not refresh repository: {error}")),
@@ -2607,7 +3314,9 @@ impl App {
 
     fn refresh(&mut self) {
         if self.busy.is_none() && self.snapshot_read.is_none() {
-            self.snapshot_read = Some(self.read(ReadKind::Snapshot));
+            self.snapshot_read = Some(self.read(ReadKind::Snapshot {
+                all_history: self.history_all,
+            }));
         }
     }
 
@@ -2678,6 +3387,8 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, repo: Repo, snapshot: Snapshot) {
+        self.mouse_position = None;
+        self.show_path = false;
         let key = self.selected_key();
         let index = self.selected;
         let cursor = (self.loaded && !self.snapshot.files.is_empty())
@@ -2688,8 +3399,12 @@ impl App {
             })
             .flatten();
         let collapsed = self.explorer.collapsed.clone();
+        let previous_explorer = self.explorer.clone();
+        let previous_remotes = self.remote_tree.clone();
         self.repo = repo;
         self.snapshot = snapshot;
+        self.remote_tree = tree::remotes(&self.snapshot);
+        self.remote_tree.restore_view(&previous_remotes);
         self.loaded = true;
         let count = self.items().len();
         let retained = key.and_then(|key| {
@@ -2714,10 +3429,35 @@ impl App {
         } else {
             self.explorer.restore_collapsed(collapsed, 0, cursor);
         }
+        if !previous_explorer.filter.is_empty() {
+            self.explorer.restore_view(&previous_explorer);
+        }
         if self.workspace == Workspace::Files
             && let Some(index) = self.explorer.selected().and_then(|row| row.file)
         {
             self.selected = index;
+        }
+        if self.workspace == Workspace::Files
+            && !self.files_tree_visible()
+            && self.snapshot.files.len() == 1
+        {
+            self.explorer.select_file(0);
+            self.selected = 0;
+            self.focus = Focus::Preview;
+        }
+        if self.workspace == Workspace::Remotes {
+            self.selected = self.remote_tree.cursor;
+        }
+        if !matches!(self.workspace, Workspace::Files | Workspace::Remotes)
+            && !self.filters[self.workspace.index()].query.is_empty()
+        {
+            let visible = self.visible_items();
+            if !visible.iter().any(|(index, _)| *index == self.selected) {
+                self.selected = visible
+                    .first()
+                    .map(|(index, _)| *index)
+                    .unwrap_or(usize::MAX);
+            }
         }
         self.last_refresh = Instant::now();
         self.request_preview(retained.is_none());
@@ -2781,6 +3521,8 @@ impl App {
                     Err(error) => format!("Could not load preview:\n{error}"),
                     _ => String::new(),
                 };
+                self.preview_search
+                    .reindex(&Document::full(&self.preview), usize::from(self.scroll));
                 self.scroll = self.scroll.min(
                     self.preview
                         .lines()
@@ -2820,10 +3562,19 @@ impl App {
                     }
                     Ok(ReadData::Output { title, text }) => self.output(&title, text),
                     Ok(ReadData::Commit(commit)) => {
-                        self.modal = Some(Modal::Commit(Box::new(CommitView::new(
-                            commit,
-                            self.history_preferences.take(),
-                        ))));
+                        let (preferences, tree) = self
+                            .history_preferences
+                            .take()
+                            .map(|(preferences, tree)| (Some(preferences), Some(tree)))
+                            .unwrap_or_default();
+                        let mut view = CommitView::new(commit, preferences);
+                        if let Some(tree) = tree {
+                            view.show_tree = tree;
+                            if !tree {
+                                view.focus = Focus::Preview;
+                            }
+                        }
+                        self.modal = Some(Modal::Commit(Box::new(view)));
                         self.load_commit_preview();
                     }
                     Err(error) => {
@@ -2848,6 +3599,35 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.modal.is_none() && self.filters[self.workspace.index()].editing {
+            let filter = &mut self.filters[self.workspace.index()];
+            if filter.query.len() + text.len() <= 1024 {
+                filter
+                    .query
+                    .extend(text.chars().filter(|character| !character.is_control()));
+                self.apply_filter();
+            }
+            return;
+        }
+        if self.modal.is_none() && self.preview_search.editing.is_some() {
+            self.preview_search.paste(text);
+            return;
+        }
+        if let Some(Modal::Commit(view)) = &mut self.modal
+            && view.filter_editing
+        {
+            let mut query = view.history.tree.filter.clone();
+            if query.len() + text.len() <= 1024 {
+                query.extend(text.chars().filter(|character| !character.is_control()));
+                view.history.tree.set_filter(&query);
+                if let Some(index) = view.history.tree.selected().and_then(|row| row.file)
+                    && view.select(index)
+                {
+                    self.load_commit_preview();
+                }
+            }
+            return;
+        }
         match &mut self.modal {
             Some(Modal::Commit(view)) => view.history.search.paste(text),
             Some(Modal::Inline { editor, .. }) => {
@@ -2996,13 +3776,17 @@ mod tests {
             Abort,
             Skip,
             Continue,
-            Unstage,
-            UnstageAll,
         ] {
             assert!(
                 command.needs_confirmation(),
                 "{:?} bypasses confirmation",
                 command
+            );
+        }
+        for command in [Stage, Unstage, StageAll, UnstageAll] {
+            assert!(
+                !command.needs_confirmation(),
+                "{command:?} must be immediate"
             );
         }
     }
