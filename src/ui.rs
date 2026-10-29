@@ -575,9 +575,9 @@ fn draw_explorer(frame: &mut Frame, app: &App, area: Rect) {
                             "▾"
                         }
                     );
-                    let suffix = format!("/ {}", row.count);
+                    let suffix = "/";
                     let width = area.width.saturating_sub(4).saturating_sub(
-                        (Span::raw(&prefix).width() + Span::raw(&suffix).width()) as u16,
+                        (Span::raw(&prefix).width() + Span::raw(suffix).width()) as u16,
                     );
                     ListItem::new(Line::from(vec![
                         Span::raw(prefix),
@@ -1193,14 +1193,13 @@ fn draw_commit(app: &App, frame: &mut Frame, view: &crate::app::CommitView, area
                         .unwrap_or_default()
                 )),
                 None => ListItem::new(format!(
-                    "{indent}{} {}/ ({})",
+                    "{indent}{} {}/",
                     if view.history.tree.collapsed.contains(&row.path) {
                         "▸"
                     } else {
                         "▾"
                     },
-                    safe_text(&row.name.to_string_lossy()),
-                    row.count
+                    safe_text(&row.name.to_string_lossy())
                 ))
                 .style(Style::default().fg(theme.muted)),
             }

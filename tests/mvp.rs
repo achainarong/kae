@@ -1868,6 +1868,40 @@ fn mouse(app: &mut app::App, kind: crossterm::event::MouseEventKind, x: u16, y: 
 }
 
 #[test]
+fn folder_names_have_no_counts_in_working_and_commit_file_trees() {
+    let fixture = Fixture::new();
+    fixture.write("src/file-123", "base\n");
+    fixture.commit("src/file-456", "base\n", "two files");
+    fixture.write("src/file-123", "changed\n");
+    fixture.write("src/file-456", "changed\n");
+    let working = app::App::ready(&fixture.repo.root).unwrap();
+    let historical = open_history(&fixture);
+    for app in [&working, &historical] {
+        let terminal = draw_at(app, 140, 40);
+        let geometry = app.geometry.borrow().clone();
+        let buffer = terminal.backend().buffer();
+        let lines = (geometry.list.y..geometry.list.y + geometry.list.height)
+            .map(|y| {
+                (geometry.list.x..geometry.list.x + geometry.list.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let folder = lines
+            .iter()
+            .find(|line| line.contains("src/"))
+            .expect("folder row");
+        let suffix = folder.split_once("src/").unwrap().1;
+        assert!(
+            !suffix.chars().any(|ch| ch.is_ascii_digit() || ch == '('),
+            "unexpected count: {folder}"
+        );
+        assert!(lines.iter().any(|line| line.contains("file-123")));
+        assert!(lines.iter().any(|line| line.contains("file-456")));
+    }
+}
+
+#[test]
 fn clicks_select_scrolled_files_commits_and_graph_connector_rows_without_writes() {
     use crossterm::event::{MouseButton::Left, MouseEventKind::Down};
     let fixture = Fixture::new();
@@ -3481,7 +3515,7 @@ fn explorer_uses_detected_project_root_when_launched_inside_a_subdirectory() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(text.contains(&format!(
-        "{}/ 2",
+        "{}/",
         fixture.repo.root.file_name().unwrap().to_string_lossy()
     )));
     key(&mut app, KeyCode::Right);

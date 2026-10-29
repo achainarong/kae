@@ -24,7 +24,7 @@ The saved script can be inspected before running. It detects your platform, down
 To pin a release or select another directory:
 
 ```sh
-KAE_INSTALL_DIR="$HOME/.local/bin" sh install-kae.sh v0.3.0
+KAE_INSTALL_DIR="$HOME/.local/bin" sh install-kae.sh v0.3.1
 ```
 
 ### Build from source
@@ -107,7 +107,7 @@ Wide terminals use side-by-side panes; narrower terminals stack them. Main navig
 
 ## File explorer
 
-The **Files** workspace starts with the detected **Git repository root** (for example, `yoda-3/`), even when Kae is launched from a subdirectory. Changed files are grouped underneath it into expandable folders. Shared single-child folder chains are compacted (for example, `apps/portal/src`), but never merged into the project-root row. The root remains visible when the working tree is clean, with a zero count. File rows show Git's two-column status: **index first, working tree second**; `??` is untracked. Folder counts include changed descendants, and fully staged folders have a soft green indicator.
+The **Files** workspace starts with the detected **Git repository root** (for example, `yoda-3/`), even when Kae is launched from a subdirectory. Changed files are grouped underneath it into expandable folders. Shared single-child folder chains are compacted (for example, `apps/portal/src`), but never merged into the project-root row. The root remains visible when the working tree is clean. File rows show Git's two-column status: **index first, working tree second**; `??` is untracked. Folder rows show only their name; fully staged folders have a soft green indicator.
 
 When there is only one changed file, Files opens its diff directly with a wrapped full path instead of spending space on folders. The commit file browser does the same for single-file commits; the main History commit list is not hidden. Press `T` to reveal the tree, or use **Toggle file tree** in Files command search. File staging shortcuts, including Space, still work with the tree hidden. Multiple changed files show the tree by default; a clean working tree retains its root row.
 
@@ -179,7 +179,7 @@ Invalid startup configuration falls back to Mocha with a visible error. Accepted
 In **History**, select a commit and press **Enter** to open its changed files as a folder tree rather than navigating one combined patch.
 
 - In the tree, `j` / `k` moves between folders/files. Enter toggles a folder or focuses the selected file's diff. Right/`l` expands a folder; Left/`h` collapses it or moves to its parent.
-- Folders show their changed-file count. The `●` marks the active file; collapsing its folder does not change the preview or lose its position.
+- The `●` marks the active file; collapsing its folder does not change the preview or lose its position.
 - `Tab` switches tree/diff focus. **`[` / `]` selects the previous/next file without leaving the diff**, revealing collapsed ancestors as needed. It stops at the first/last file rather than wrapping.
 - In the diff, `j` / `k`, PageUp/PageDown, Home/End, and `h` / `l` scroll. **`{` / `}` jumps between hunks** (replacing the old `n` / `p` shortcuts in this view).
 - **`d` toggles unified and side-by-side diffs.** Split view aligns old/new lines and shows their actual line numbers, with blank cells for missing lines. A terminal narrower than 120 columns falls back to unified without changing the preference. Binary, metadata-only, or incomplete/truncated patches also stay unified; Kae does not invent missing content.
@@ -284,8 +284,8 @@ Each archive contains `kae` and has a matching `.sha256`; releases also include 
 For a maintainer-triggered release, first review/commit/push the intended changes and set the Cargo version. For the current version, the release commands are:
 
 ```sh
-git tag -a v0.3.0 -m "Kae 0.3.0"
-git push origin v0.3.0
+git tag -a v0.3.1 -m "Kae 0.3.1"
+git push origin v0.3.1
 ```
 
 Only tag reviewed code. The workflow files must already exist in that tagged commit, and GitHub Actions must be enabled. These commands are instructions, not actions performed by Kae. Hosted CI/release execution requires pushing the workflow; local validation cannot substitute for the first three-platform run.
